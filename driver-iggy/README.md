@@ -1,0 +1,87 @@
+# Apache Iggy driver
+
+Runs the OpenMessaging Benchmark against [Apache Iggy](https://iggy.apache.org/) over the TCP
+transport, through the Java SDK (`org.apache.iggy:iggy`).
+
+## Requirements
+
+* JDK 17 and Maven 3.8+
+* `iggy-server` 0.9.0 or a build from `master`. The driver needs the VSR wire protocol that 0.9.0
+  introduces; 0.8.0 cannot log in. Until 0.9.0 is on Maven Central the module depends on
+  `0.9.0-SNAPSHOT`, resolved from the ASF snapshot repository declared in its `pom.xml`.
+
+## Running against a local server
+
+1. Start the server on a fresh data directory with the default root credentials (`iggy` / `iggy`).
+   Without `--with-default-root-credentials` a fresh data directory gets a random root password.
+
+   ```
+   iggy-server --fresh --with-default-root-credentials
+   ```
+2. Build the distribution from the repository root. `benchmark-framework` fails its own spotless and
+   spotbugs checks at the current upstream master, so both are skipped for the whole build;
+   `driver-iggy` passes them on its own (`mvn -pl driver-iggy verify`).
+
+   ```
+   mvn -DskipTests -Dspotless.check.skip=true -Dspotbugs.skip=true install
+   ```
+3. Unpack the tarball and run the one-minute smoke workload. With no `--workers` and no
+   `workers.yaml` in the working directory the benchmark runs one in-process worker.
+
+   ```
+   tar xzf package/target/openmessaging-benchmark-0.0.1-SNAPSHOT-bin.tar.gz
+   cd openmessaging-benchmark-0.0.1-SNAPSHOT
+   bin/benchmark --drivers driver-iggy/iggy.yaml driver-iggy/smoke-workload.yaml
+   ```
+4. Run the standard workloads and render the charts. `bin/benchmark` exits 0 even when a run fails,
+   so check that the `publishLatency*` and `endToEndLatency*` series in the result JSON are non-zero.
+
+   ```
+   bin/benchmark --drivers driver-iggy/iggy.yaml \
+       workloads/1-topic-1-partition-1kb.yaml \
+       workloads/max-rate-1-topic-16-partitions-1kb.yaml
+   bin/create_charts.py *.json
+   ```
+
+## Configuration (`iggy.yaml`)
+
+|          Key           |       Default       |                          Meaning                          |
+|------------------------|---------------------|-----------------------------------------------------------|
+| `host`, `port`         | `127.0.0.1`, `8090` | TCP listener of the server                                |
+| `username`, `password` | `iggy`, `iggy`      | Credentials every connection logs in with                 |
+| `streamName`           | `omb`               | Stream holding the benchmark topics, created when missing |
+| `producerBatchSize`    | `1000`              | Flush a batch once it holds this many messages            |
+| `producerBatchBytes`   | `1048576`           | Flush a batch once its payloads reach this many bytes     |
+| `producerLingerMs`     | `1`                 | Flush open batches this often, whatever their size        |
+| `consumerPollSize`     | `1000`              | Maximum number of messages one poll asks for              |
+
+## How the driver maps the benchmark onto Iggy
+
+* One admin connection creates the stream and the topics. Topics are created with
+  `CompressionAlgorithm.None`, no message expiry and no size limit, so the server defaults apply to
+  the numbers: `messages_required_to_save = 1024`, `enforce_fsync = false`. The topics a run created
+  are deleted when the driver closes, so repeated runs do not fill the disk.
+* Every producer owns one connection. `sendAsync` stamps `originTimestamp` with the current wall
+  clock in microseconds, buffers the message and flushes by size, bytes or linger as one
+  `sendMessages` call. Messages without a key go with `Partitioning.balanced()`, which the SDK
+  resolves to one partition per batch, rotating; keyed messages are bucketed by
+  `xxh32(key) % partitions`, the mapping `Partitioning.messagesKey` uses, and each bucket is sent
+  with `Partitioning.partitionId`. A message future completes when its batch is acknowledged, which
+  means committed to the replicated log and visible to consumers, not fsynced.
+* Every consumer owns one connection and one poll thread. The consumers of one subscription form one
+  Iggy consumer group named after the subscription, so every subscription receives every message.
+  Polls use `PollingStrategy.next()` with auto-commit. One poll serves one partition of the member's
+  assignment, so the loop backs off only after a full empty cycle. End-to-end latency is
+  `now - originTimestamp / 1000` in milliseconds.
+
+## Notes
+
+* The SDK and its runtime dependencies (netty 4.2, Jackson 3, httpclient5, commons-lang3, hash4j)
+  are shaded and relocated into the driver jar, because the distribution ships only `netty-all`
+  4.1 and strips every individual netty module from `lib/`.
+* Every connection runs its own netty event loop group, so the thread count grows with producers
+  plus consumers.
+* Joining a group is cooperative with a 30 s rebalancing timeout. With `consumerPerSubscription > 1`
+  late joiners get partitions only after the owner drains them or the timeout passes, so expect a
+  startup transient inside the 60 s readiness window.
+

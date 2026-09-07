@@ -49,6 +49,7 @@
         <module>driver-rabbitmq</module>
         <module>driver-artemis</module>
         <module>driver-bookkeeper</module>
+        <module>driver-iggy</module>
         <module>driver-rocketmq</module>
         <module>driver-rocketmq5</module>
         <module>driver-nats</module>

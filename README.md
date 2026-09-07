@@ -12,6 +12,7 @@ This repository houses user-friendly, cloud-ready benchmarking suites for the fo
 
 * [Apache ActiveMQ Artemis](https://activemq.apache.org/components/artemis/)
 * [Apache Bookkeeper](https://bookkeeper.apache.org)
+* [Apache Iggy](https://iggy.apache.org/)
 * [Apache Kafka](https://kafka.apache.org)
 * [Apache Pulsar](https://pulsar.apache.org)
 * [Apache RocketMQ](https://rocketmq.apache.org)
