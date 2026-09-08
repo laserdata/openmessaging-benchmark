@@ -21,14 +21,38 @@ port: 8090
 username: iggy
 password: iggy
 
+# Optional bootstrap list, `host:port` entries tried round-robin and fallen through on a
+# failed dial or login. Overrides host/port when non-empty. Every login is redirected to the
+# metadata leader by the SDK, so this only helps a run start when one node is down.
+hosts: []
+
+# Client timeouts. A dropped request is only noticed when requestTimeoutMs elapses.
+connectionTimeoutMs: 3000
+requestTimeoutMs: 30000
+
+# Redial policy after a lost connection: default (SDK: 12 attempts 5 s apart), none,
+# exponential, or fixed with retryMaxRetries attempts retryDelayMs apart.
+retryPolicy: default
+retryMaxRetries: 12
+retryDelayMs: 5000
+
 # Stream holding the benchmark topics. Created when missing.
 streamName: omb
+
+# Options passed at CreateTopic, keyed by server option name; values are strings the server
+# parses. Empty means server defaults (enforce_fsync=false, messages_required_to_save=1024,
+# segment_size=1GiB). See iggy-fsync.yaml for the durable cell.
+topicOptions: {}
 
 # A producer batch is flushed when it reaches producerBatchSize messages or
 # producerBatchBytes bytes of payload, or when producerLingerMs elapsed.
 producerBatchSize: 1000
 producerBatchBytes: 1048576
 producerLingerMs: 1
+
+# Batches a producer may have in flight before sendAsync blocks the load thread.
+# 0 disables the cap (unbounded memory under producerRate: 0).
+producerMaxInFlightBatches: 16
 
 # Maximum number of messages one poll asks for.
 consumerPollSize: 1000

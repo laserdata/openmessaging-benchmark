@@ -24,10 +24,15 @@ import io.openmessaging.benchmark.driver.ConsumerCallback;
 import java.io.File;
 import java.io.IOException;
 import java.math.BigInteger;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
+import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
@@ -35,13 +40,17 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.bookkeeper.stats.StatsLogger;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
+import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientBuilder;
+import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.exception.IggyConflictException;
 import org.apache.iggy.exception.IggyResourceNotFoundException;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.stream.StreamDetails;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.TopicDetails;
@@ -61,15 +70,19 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
 
     private static final ObjectMapper mapper =
             new ObjectMapper(new YAMLFactory())
-                    .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+                    .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, true);
 
     private static final long CLOSE_TIMEOUT_SECONDS = 30;
 
     private IggyConfig config;
     private StreamId streamId;
+    private List<Endpoint> endpoints;
+    private Optional<RetryPolicy> retryPolicy;
+    private Map<String, HeaderValue> topicOptions;
     private AsyncIggyTcpClient admin;
     private ScheduledExecutorService lingerExecutor;
 
+    private final AtomicInteger nextEndpoint = new AtomicInteger();
     private final List<String> createdTopics = Collections.synchronizedList(new ArrayList<>());
     private final List<IggyBenchmarkProducer> producers =
             Collections.synchronizedList(new ArrayList<>());
@@ -80,6 +93,9 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
     public void initialize(File configurationFile, StatsLogger statsLogger) throws IOException {
         config = mapper.readValue(configurationFile, IggyConfig.class);
         streamId = StreamId.of(config.streamName);
+        endpoints = endpoints(config);
+        retryPolicy = retryPolicy(config);
+        topicOptions = topicOptions(config);
         lingerExecutor =
                 Executors.newSingleThreadScheduledExecutor(
                         runnable -> {
@@ -90,22 +106,97 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
         admin = connect().join();
         ensureStream();
         log.info(
-                "Iggy driver initialized: {}:{} stream={} batchSize={} batchBytes={} lingerMs={} pollSize={}",
-                config.host,
-                config.port,
+                "Iggy driver initialized: endpoints={} stream={} connectionTimeoutMs={} requestTimeoutMs={}"
+                        + " retryPolicy={} topicOptions={} batchSize={} batchBytes={} lingerMs={}"
+                        + " maxInFlightBatches={} pollSize={}",
+                endpoints,
                 config.streamName,
+                config.connectionTimeoutMs,
+                config.requestTimeoutMs,
+                config.retryPolicy,
+                config.topicOptions,
                 config.producerBatchSize,
                 config.producerBatchBytes,
                 config.producerLingerMs,
+                config.producerMaxInFlightBatches,
                 config.consumerPollSize);
     }
 
+    static List<Endpoint> endpoints(IggyConfig config) {
+        if (config.hosts == null || config.hosts.isEmpty()) {
+            return List.of(new Endpoint(config.host, config.port));
+        }
+        List<Endpoint> result = new ArrayList<>();
+        for (String address : config.hosts) {
+            result.add(Endpoint.parse(address, config.port));
+        }
+        return Collections.unmodifiableList(result);
+    }
+
+    static Optional<RetryPolicy> retryPolicy(IggyConfig config) {
+        String policy = config.retryPolicy == null ? "default" : config.retryPolicy;
+        switch (policy.toLowerCase(Locale.ROOT)) {
+            case "default":
+                return Optional.empty();
+            case "none":
+                return Optional.of(RetryPolicy.noRetry());
+            case "exponential":
+                return Optional.of(RetryPolicy.exponentialBackoff());
+            case "fixed":
+                return Optional.of(
+                        RetryPolicy.fixedDelay(config.retryMaxRetries, Duration.ofMillis(config.retryDelayMs)));
+            default:
+                throw new IllegalArgumentException(
+                        "Unknown retryPolicy '"
+                                + config.retryPolicy
+                                + "', expected default, none, exponential or fixed");
+        }
+    }
+
+    static Map<String, HeaderValue> topicOptions(IggyConfig config) {
+        Map<String, HeaderValue> options = new LinkedHashMap<>();
+        if (config.topicOptions != null) {
+            config.topicOptions.forEach((key, value) -> options.put(key, HeaderValue.fromString(value)));
+        }
+        return Collections.unmodifiableMap(options);
+    }
+
     private CompletableFuture<AsyncIggyTcpClient> connect() {
-        return AsyncIggyTcpClient.builder()
-                .host(config.host)
-                .port(config.port)
-                .credentials(config.username, config.password)
-                .buildAndLogin();
+        int start = Math.floorMod(nextEndpoint.getAndIncrement(), endpoints.size());
+        return connect(start, 1);
+    }
+
+    private CompletableFuture<AsyncIggyTcpClient> connect(int index, int attempt) {
+        Endpoint endpoint = endpoints.get(index % endpoints.size());
+        CompletableFuture<AsyncIggyTcpClient> login;
+        try {
+            login = login(endpoint);
+        } catch (RuntimeException e) {
+            login = CompletableFuture.failedFuture(e);
+        }
+        if (attempt >= endpoints.size()) {
+            return login;
+        }
+        return login.exceptionallyCompose(
+                error -> {
+                    log.warn(
+                            "Connecting to {} failed ({}), trying the next bootstrap address",
+                            endpoint,
+                            unwrap(error).toString());
+                    return connect(index + 1, attempt + 1);
+                });
+    }
+
+    private CompletableFuture<AsyncIggyTcpClient> login(Endpoint endpoint) {
+        AsyncIggyTcpClientBuilder builder =
+                AsyncIggyTcpClient.builder()
+                        .host(endpoint.host())
+                        .port(endpoint.port())
+                        .credentials(config.username, config.password)
+                        .connectionTimeout(Duration.ofMillis(config.connectionTimeoutMs))
+                        .requestTimeout(Duration.ofMillis(config.requestTimeoutMs));
+        retryPolicy.ifPresent(builder::retryPolicy);
+        return builder.buildAndLogin();
     }
 
     private void ensureStream() {
@@ -139,6 +230,10 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
         return "test-topic";
     }
 
+    /**
+     * Creates the topic with the configured options. A key or value the server refuses fails the
+     * future, and with it the run, which is the loud failure we want.
+     */
     @Override
     public CompletableFuture<Void> createTopic(String topic, int partitions) {
         return admin
@@ -149,12 +244,25 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
                         CompressionAlgorithm.None,
                         BigInteger.ZERO,
                         BigInteger.ZERO,
-                        topic)
+                        topic,
+                        topicOptions)
                 .thenAccept(
                         details -> {
                             createdTopics.add(topic);
-                            log.info("Created topic {} with {} partitions", topic, partitions);
+                            log.info(
+                                    "Created topic {} with {} partitions, requested options {}, effective options {}",
+                                    topic,
+                                    partitions,
+                                    config.topicOptions,
+                                    effectiveOptions(details));
                         });
+    }
+
+    static Map<String, String> effectiveOptions(TopicDetails details) {
+        Map<String, String> effective = new TreeMap<>();
+        details.derivedOptions().forEach((key, value) -> effective.put(key, value.toStringValue()));
+        details.options().forEach((key, value) -> effective.put(key, value.toStringValue()));
+        return effective;
     }
 
     @Override
@@ -329,5 +437,41 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
             current = current.getCause();
         }
         return current;
+    }
+
+    /**
+     * One bootstrap address.
+     *
+     * @param host host name or IP address
+     * @param port TCP port
+     */
+    record Endpoint(String host, int port) {
+
+        /**
+         * Parses one {@code hosts} entry.
+         *
+         * @param address {@code host:port}, or a bare {@code host}
+         * @param defaultPort port used when the entry has none
+         * @return the endpoint
+         */
+        static Endpoint parse(String address, int defaultPort) {
+            String trimmed = address == null ? "" : address.trim();
+            int colon = trimmed.lastIndexOf(':');
+            if (colon < 0) {
+                return new Endpoint(trimmed, defaultPort);
+            }
+            try {
+                return new Endpoint(
+                        trimmed.substring(0, colon), Integer.parseInt(trimmed.substring(colon + 1)));
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException(
+                        "Invalid entry in hosts: '" + address + "', expected host:port", e);
+            }
+        }
+
+        @Override
+        public String toString() {
+            return host + ":" + port;
+        }
     }
 }

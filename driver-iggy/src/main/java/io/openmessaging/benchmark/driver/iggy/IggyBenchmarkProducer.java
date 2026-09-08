@@ -20,6 +20,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -28,6 +29,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.hash.XxHash32;
@@ -50,6 +52,12 @@ import org.slf4j.LoggerFactory;
  * routes round-robin over the partitions; keyed messages are bucketed with the same {@code
  * xxh32(key) % partitions} mapping the SDK uses for {@code Partitioning.messagesKey}. Every message
  * future completes when the reply for its batch arrives.
+ *
+ * <p>At most {@code producerMaxInFlightBatches} batches are in flight per producer. A full batch
+ * waits for a permit on the worker's load thread, which is the backpressure OMB expects from a
+ * driver (Kafka blocks on {@code buffer.memory}, Pulsar on {@code blockIfQueueFull}). The linger
+ * thread is shared by every producer in the process and therefore never waits: batches it cannot
+ * send stay open until the next tick or until they fill up.
  */
 public class IggyBenchmarkProducer implements BenchmarkProducer {
 
@@ -58,6 +66,11 @@ public class IggyBenchmarkProducer implements BenchmarkProducer {
     /** Bucket key of messages sent without a key. Partition ids are never negative. */
     private static final long BALANCED_BUCKET = -1L;
 
+    /** How often a blocked sender re-checks whether the producer was closed. */
+    private static final long PERMIT_POLL_MILLIS = 100;
+
+    private static final long CLOSE_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(30);
+
     private final AsyncIggyTcpClient client;
     private final StreamId streamId;
     private final TopicId topicId;
@@ -65,6 +78,9 @@ public class IggyBenchmarkProducer implements BenchmarkProducer {
     private final int batchSize;
     private final long batchBytes;
     private final ScheduledFuture<?> lingerTask;
+
+    /** One permit per batch that may be in flight; {@code null} when the cap is disabled. */
+    private final Semaphore inFlightPermits;
 
     private final Object lock = new Object();
 
@@ -90,6 +106,10 @@ public class IggyBenchmarkProducer implements BenchmarkProducer {
         this.partitionsCount = Math.max(1, partitionsCount);
         this.batchSize = Math.max(1, config.producerBatchSize);
         this.batchBytes = Math.max(1, config.producerBatchBytes);
+        this.inFlightPermits =
+                config.producerMaxInFlightBatches > 0
+                        ? new Semaphore(config.producerMaxInFlightBatches)
+                        : null;
         long lingerMs = Math.max(1, config.producerLingerMs);
         this.lingerTask =
                 lingerExecutor.scheduleAtFixedRate(
@@ -116,7 +136,11 @@ public class IggyBenchmarkProducer implements BenchmarkProducer {
             }
         }
         if (full != null) {
-            send(full);
+            if (acquirePermit(false)) {
+                send(full);
+            } else {
+                full.fail(new IllegalStateException("Producer closed while waiting to send"));
+            }
         }
         return future;
     }
@@ -142,20 +166,64 @@ public class IggyBenchmarkProducer implements BenchmarkProducer {
         return now.getEpochSecond() * 1_000_000L + now.getNano() / 1_000L;
     }
 
+    // Linger tick, on the shared linger thread. Takes a permit per batch without waiting; batches
+    // that get none stay open for the next tick or until a sendAsync fills them.
     private void flushAll() {
-        List<Batch> ready;
+        List<Batch> ready = new ArrayList<>();
         synchronized (lock) {
-            if (buckets.isEmpty()) {
-                return;
+            Iterator<Batch> open = buckets.values().iterator();
+            while (open.hasNext()) {
+                Batch batch = open.next();
+                if (inFlightPermits != null && !inFlightPermits.tryAcquire()) {
+                    break;
+                }
+                open.remove();
+                ready.add(batch);
             }
-            ready = new ArrayList<>(buckets.values());
-            buckets.clear();
         }
         for (Batch batch : ready) {
             send(batch);
         }
     }
 
+    /**
+     * Takes one in-flight permit, waiting as long as needed.
+     *
+     * @param closing {@code false} on the load thread, where a close of the producer ends the wait;
+     *     {@code true} during close, where the wait is bounded by the close timeout instead
+     * @return whether a permit was taken; {@code false} means the batch must be failed
+     */
+    private boolean acquirePermit(boolean closing) {
+        if (inFlightPermits == null) {
+            return true;
+        }
+        long deadline = System.nanoTime() + CLOSE_TIMEOUT_NANOS;
+        try {
+            while (!inFlightPermits.tryAcquire(PERMIT_POLL_MILLIS, TimeUnit.MILLISECONDS)) {
+                if (closing ? System.nanoTime() >= deadline : isClosed()) {
+                    return false;
+                }
+            }
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    private void releasePermit() {
+        if (inFlightPermits != null) {
+            inFlightPermits.release();
+        }
+    }
+
+    private boolean isClosed() {
+        synchronized (lock) {
+            return closed;
+        }
+    }
+
+    // Sends one batch. The caller holds its permit; every completion path releases it.
     private void send(Batch batch) {
         Partitioning partitioning =
                 batch.bucketKey == BALANCED_BUCKET
@@ -165,6 +233,7 @@ public class IggyBenchmarkProducer implements BenchmarkProducer {
         try {
             sent = client.messages().sendMessages(streamId, topicId, partitioning, batch.messages);
         } catch (RuntimeException e) {
+            releasePermit();
             batch.fail(e);
             return;
         }
@@ -173,6 +242,7 @@ public class IggyBenchmarkProducer implements BenchmarkProducer {
         sent.whenComplete(
                 (response, error) -> {
                     inFlight.remove(sent);
+                    releasePermit();
                     if (error == null) {
                         batch.complete();
                     } else {
@@ -189,14 +259,23 @@ public class IggyBenchmarkProducer implements BenchmarkProducer {
 
     @Override
     public void close() throws Exception {
+        List<Batch> remaining;
         synchronized (lock) {
             if (closed) {
                 return;
             }
             closed = true;
+            remaining = new ArrayList<>(buckets.values());
+            buckets.clear();
         }
         lingerTask.cancel(false);
-        flushAll();
+        for (Batch batch : remaining) {
+            if (acquirePermit(true)) {
+                send(batch);
+            } else {
+                batch.fail(new IllegalStateException("Producer closed before the batch was sent"));
+            }
+        }
         IggyBenchmarkDriver.awaitQuietly(
                 CompletableFuture.allOf(inFlight.toArray(new CompletableFuture[0])),
                 "waiting for in-flight batches of " + topicId);

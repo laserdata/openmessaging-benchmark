@@ -31,6 +31,8 @@ JVM_OPTS="$JVM_OPTS -Dio.netty.tryReflectionSetAccessible=true"
 JVM_OPTS="$JVM_OPTS --add-opens java.base/java.nio=ALL-UNNAMED --add-opens java.base/jdk.internal.misc=ALL-UNNAMED"
 # Set io.netty.tryReflectionSetAccessible in Pulsar's shaded client
 JVM_OPTS="$JVM_OPTS -Dorg.apache.pulsar.shade.io.netty.tryReflectionSetAccessible=true"
+# Same for the Iggy driver's shaded netty; the shade plugin relocates the property name too
+JVM_OPTS="$JVM_OPTS -Dio.openmessaging.benchmark.driver.iggy.shaded.io.netty.tryReflectionSetAccessible=true"
 # Required by Pulsar client optimized checksum calculation on other than Linux x86_64 platforms
 # reflection access to java.util.zip.CRC32C
 JVM_OPTS="$JVM_OPTS --add-opens java.base/java.util.zip=ALL-UNNAMED"
