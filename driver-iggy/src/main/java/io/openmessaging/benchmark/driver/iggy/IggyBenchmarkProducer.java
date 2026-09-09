@@ -238,7 +238,6 @@ public class IggyBenchmarkProducer implements BenchmarkProducer {
             return;
         }
         inFlight.add(sent);
-        // Runs on the netty event loop: only complete the worker's futures here.
         sent.whenComplete(
                 (response, error) -> {
                     inFlight.remove(sent);

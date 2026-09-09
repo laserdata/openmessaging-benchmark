@@ -25,6 +25,10 @@ username: iggy
 password: iggy
 hosts: []
 
+# Netty event loop threads shared by every connection of this worker. Omit for min(8, cores);
+# 0 gives every connection its own single-thread loop (SDK default).
+# ioThreads: 8
+
 connectionTimeoutMs: 3000
 requestTimeoutMs: 30000
 retryPolicy: default

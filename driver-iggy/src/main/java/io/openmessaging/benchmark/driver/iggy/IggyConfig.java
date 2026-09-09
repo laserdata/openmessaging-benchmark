@@ -51,6 +51,15 @@ public class IggyConfig {
     /** Password every connection logs in with. */
     public String password = "iggy";
 
+    /**
+     * Netty event loop threads shared by every connection this driver instance opens (admin,
+     * producers, consumers). One loop per core is plenty: the loops only do socket I/O and frame
+     * decoding, while producing runs on the worker's load threads and every consumer has its own poll
+     * thread. Default is the smaller of 8 and the core count. 0 disables sharing and gives every
+     * connection its own single-thread loop, the SDK default.
+     */
+    public int ioThreads = Math.min(8, Runtime.getRuntime().availableProcessors());
+
     /** Dial timeout of every connection, in milliseconds. */
     public long connectionTimeoutMs = 3000;
 

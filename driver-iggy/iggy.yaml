@@ -27,6 +27,10 @@ password: iggy
 hosts: []
 
 # Client timeouts. A dropped request is only noticed when requestTimeoutMs elapses.
+# Netty event loop threads shared by every connection of this worker. Omit for min(8, cores);
+# 0 gives every connection its own single-thread loop (SDK default).
+# ioThreads: 8
+
 connectionTimeoutMs: 3000
 requestTimeoutMs: 30000
 

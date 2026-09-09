@@ -17,6 +17,10 @@ package io.openmessaging.benchmark.driver.iggy;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
+import io.netty.channel.IoEventLoopGroup;
+import io.netty.channel.MultiThreadIoEventLoopGroup;
+import io.netty.channel.nio.NioIoHandler;
+import io.netty.util.concurrent.DefaultThreadFactory;
 import io.openmessaging.benchmark.driver.BenchmarkConsumer;
 import io.openmessaging.benchmark.driver.BenchmarkDriver;
 import io.openmessaging.benchmark.driver.BenchmarkProducer;
@@ -82,6 +86,9 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
     private AsyncIggyTcpClient admin;
     private ScheduledExecutorService lingerExecutor;
 
+    /** Shared by every connection; null when {@code ioThreads} is 0. */
+    private IoEventLoopGroup ioGroup;
+
     private final AtomicInteger nextEndpoint = new AtomicInteger();
     private final List<String> createdTopics = Collections.synchronizedList(new ArrayList<>());
     private final List<IggyBenchmarkProducer> producers =
@@ -103,13 +110,15 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
                             thread.setDaemon(true);
                             return thread;
                         });
+        ioGroup = ioGroup(config);
         admin = connect().join();
         ensureStream();
         log.info(
-                "Iggy driver initialized: endpoints={} stream={} connectionTimeoutMs={} requestTimeoutMs={}"
-                        + " retryPolicy={} topicOptions={} batchSize={} batchBytes={} lingerMs={}"
-                        + " maxInFlightBatches={} pollSize={}",
+                "Iggy driver initialized: endpoints={} ioThreads={} stream={} connectionTimeoutMs={}"
+                        + " requestTimeoutMs={} retryPolicy={} topicOptions={} batchSize={} batchBytes={}"
+                        + " lingerMs={} maxInFlightBatches={} pollSize={}",
                 endpoints,
+                config.ioThreads,
                 config.streamName,
                 config.connectionTimeoutMs,
                 config.requestTimeoutMs,
@@ -120,6 +129,25 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
                 config.producerLingerMs,
                 config.producerMaxInFlightBatches,
                 config.consumerPollSize);
+    }
+
+    /**
+     * Builds the event loop group every connection registers on, or null for one loop per connection.
+     * Callbacks run on these loops, so nothing in this driver may block inside a completion stage.
+     *
+     * @param config the driver settings
+     * @return the shared group, or null when {@code ioThreads} is 0
+     */
+    static IoEventLoopGroup ioGroup(IggyConfig config) {
+        if (config.ioThreads < 0) {
+            throw new IllegalArgumentException(
+                    "ioThreads must be 0 or positive, got " + config.ioThreads);
+        }
+        if (config.ioThreads == 0) {
+            return null;
+        }
+        return new MultiThreadIoEventLoopGroup(
+                config.ioThreads, new DefaultThreadFactory("iggy-io", true), NioIoHandler.newFactory());
     }
 
     static List<Endpoint> endpoints(IggyConfig config) {
@@ -196,6 +224,9 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
                         .connectionTimeout(Duration.ofMillis(config.connectionTimeoutMs))
                         .requestTimeout(Duration.ofMillis(config.requestTimeoutMs));
         retryPolicy.ifPresent(builder::retryPolicy);
+        if (ioGroup != null) {
+            builder.eventLoopGroup(ioGroup);
+        }
         return builder.buildAndLogin();
     }
 
@@ -382,18 +413,27 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
         if (lingerExecutor != null) {
             lingerExecutor.shutdownNow();
         }
-        if (admin == null) {
-            return;
+        if (admin != null) {
+            for (String topic : new ArrayList<>(createdTopics)) {
+                awaitQuietly(
+                        admin
+                                .topics()
+                                .deleteTopic(streamId, TopicId.of(topic))
+                                .thenRun(() -> log.info("Deleted topic {}", topic)),
+                        "deleting topic " + topic);
+            }
+            awaitQuietly(admin.close(), "closing admin connection");
         }
-        for (String topic : new ArrayList<>(createdTopics)) {
-            awaitQuietly(
-                    admin
-                            .topics()
-                            .deleteTopic(streamId, TopicId.of(topic))
-                            .thenRun(() -> log.info("Deleted topic {}", topic)),
-                    "deleting topic " + topic);
+        if (ioGroup != null) {
+            try {
+                ioGroup
+                        .shutdownGracefully(0, CLOSE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                        .await(CLOSE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.warn("Interrupted while shutting down the event loop group");
+            }
         }
-        awaitQuietly(admin.close(), "closing admin connection");
     }
 
     /**

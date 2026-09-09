@@ -30,6 +30,9 @@
         <!-- Versions the SDK was built against. The root dependencyManagement would otherwise downgrade them. -->
         <iggy.commons.lang3.version>3.20.0</iggy.commons.lang3.version>
         <iggy.jackson.annotations.version>2.22</iggy.jackson.annotations.version>
+        <!-- Same netty line as the SDK. Compile-scope so the driver can build the shared event loop group;
+             the SDK declares netty as runtime. Shaded and relocated like the rest of io.netty. -->
+        <iggy.netty.version>4.2.17.Final</iggy.netty.version>
         <iggy.shade.prefix>io.openmessaging.benchmark.driver.iggy.shaded</iggy.shade.prefix>
         <maven.shade.plugin.version>3.6.0</maven.shade.plugin.version>
     </properties>
@@ -44,6 +47,12 @@
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-annotations</artifactId>
             <version>${iggy.jackson.annotations.version}</version>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-transport</artifactId>
+            <version>${iggy.netty.version}</version>
             <optional>true</optional>
         </dependency>
         <dependency>

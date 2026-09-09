@@ -50,6 +50,7 @@ transport, through the Java SDK (`org.apache.iggy:iggy`).
 | `host`, `port`                    | `127.0.0.1`, `8090` | TCP listener of the server                                                                        |
 | `hosts`                           | `[]`                | Bootstrap list of `host:port`, tried round-robin with fall-through; overrides `host`/`port`       |
 | `username`, `password`            | `iggy`, `iggy`      | Credentials every connection logs in with                                                         |
+| `ioThreads`                       | `min(8, cores)`     | Netty event loop threads shared by every connection of the worker; `0` = one loop per connection  |
 | `connectionTimeoutMs`             | `3000`              | Dial timeout of every connection                                                                  |
 | `requestTimeoutMs`                | `30000`             | Time a request may wait for its reply; bounds how late a dropped request fails                    |
 | `retryPolicy`                     | `default`           | Redial after a lost connection: `default` (12 attempts 5 s apart), `none`, `exponential`, `fixed` |
@@ -107,8 +108,13 @@ misspelled key cannot silently run with the default.
   system property names as well; `bin/benchmark-worker` therefore sets
   `-Dio.openmessaging.benchmark.driver.iggy.shaded.io.netty.tryReflectionSetAccessible=true` next
   to the plain and the Pulsar-shaded variants.
-* Every connection runs its own netty event loop group, so the thread count grows with producers
-  plus consumers.
+* All connections of one worker share one netty event loop group of `ioThreads` loops (SDK
+  `eventLoopGroup(...)`, needs `0.9.0-SNAPSHOT` build 20 or newer). The loops only do socket I/O
+  and frame decoding: producing runs on the worker's load threads and every consumer has its own
+  poll thread, so the thread count no longer grows with producers plus consumers. Completion
+  callbacks run on the shared loops, which is why the producer never blocks inside one; the
+  in-flight permit is taken on the load thread before a batch is sent. `ioThreads: 0` falls back to
+  the SDK default of one single-thread loop per connection.
 * In a cluster every login converges on the metadata leader: the SDK fetches the roster after login
   and retargets the connection, and at view 0 every partition's primary is replica 0. In a healthy
   run all client traffic therefore lands on one node and the followers only replicate. `hosts` buys
