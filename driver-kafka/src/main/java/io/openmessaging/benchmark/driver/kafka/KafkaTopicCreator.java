@@ -86,6 +86,9 @@ class KafkaTopicCreator {
             }
         } finally {
             loggingFuture.cancel(true);
+            // The executor is per instance and non-daemon; left running it keeps the coordinator
+            // JVM alive after Benchmark.main returns (main ends with worker.close(), no System.exit).
+            executor.shutdownNow();
         }
     }
 
