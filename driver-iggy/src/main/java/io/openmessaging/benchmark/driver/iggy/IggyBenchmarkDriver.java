@@ -116,7 +116,8 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
         log.info(
                 "Iggy driver initialized: endpoints={} ioThreads={} stream={} connectionTimeoutMs={}"
                         + " requestTimeoutMs={} retryPolicy={} topicOptions={} batchSize={} batchBytes={}"
-                        + " lingerMs={} maxInFlightBatches={} pollSize={}",
+                        + " lingerMs={} maxInFlightBatches={} pollSize={} autoCommit={}"
+                        + " commitIntervalMs={}",
                 endpoints,
                 config.ioThreads,
                 config.streamName,
@@ -128,7 +129,9 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
                 config.producerBatchBytes,
                 config.producerLingerMs,
                 config.producerMaxInFlightBatches,
-                config.consumerPollSize);
+                config.consumerPollSize,
+                config.consumerAutoCommit,
+                config.consumerCommitIntervalMs);
     }
 
     /**
@@ -341,13 +344,7 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
                         partitions -> {
                             IggyBenchmarkConsumer consumer =
                                     new IggyBenchmarkConsumer(
-                                            client,
-                                            streamId,
-                                            topicId,
-                                            groupId,
-                                            partitions,
-                                            config.consumerPollSize,
-                                            callback);
+                                            client, streamId, topicId, groupId, partitions, config, callback);
                             consumers.add(consumer);
                             return consumer;
                         });

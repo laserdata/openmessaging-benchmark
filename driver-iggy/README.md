@@ -45,23 +45,25 @@ transport, through the Java SDK (`org.apache.iggy:iggy`).
 
 ## Configuration (`iggy.yaml`, `iggy-fsync.yaml`)
 
-|                Key                |       Default       |                                              Meaning                                              |
-|-----------------------------------|---------------------|---------------------------------------------------------------------------------------------------|
-| `host`, `port`                    | `127.0.0.1`, `8090` | TCP listener of the server                                                                        |
-| `hosts`                           | `[]`                | Bootstrap list of `host:port`, tried round-robin with fall-through; overrides `host`/`port`       |
-| `username`, `password`            | `iggy`, `iggy`      | Credentials every connection logs in with                                                         |
-| `ioThreads`                       | `min(8, cores)`     | Netty event loop threads shared by every connection of the worker; `0` = one loop per connection  |
-| `connectionTimeoutMs`             | `3000`              | Dial timeout of every connection                                                                  |
-| `requestTimeoutMs`                | `30000`             | Time a request may wait for its reply; bounds how late a dropped request fails                    |
-| `retryPolicy`                     | `default`           | Redial after a lost connection: `default` (12 attempts 5 s apart), `none`, `exponential`, `fixed` |
-| `retryMaxRetries`, `retryDelayMs` | `12`, `5000`        | Attempts and delay for `retryPolicy: fixed`                                                       |
-| `streamName`                      | `omb`               | Stream holding the benchmark topics, created when missing                                         |
-| `topicOptions`                    | `{}`                | Options passed at CreateTopic, keyed by server option name, values as strings                     |
-| `producerBatchSize`               | `1000`              | Flush a batch once it holds this many messages                                                    |
-| `producerBatchBytes`              | `1048576`           | Flush a batch once its payloads reach this many bytes                                             |
-| `producerLingerMs`                | `1`                 | Flush open batches this often, whatever their size                                                |
-| `producerMaxInFlightBatches`      | `16`                | Batches a producer may have in flight before `sendAsync` blocks; `0` = no cap                     |
-| `consumerPollSize`                | `1000`              | Maximum number of messages one poll asks for                                                      |
+|                Key                |       Default       |                                                                       Meaning                                                                       |
+|-----------------------------------|---------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------|
+| `host`, `port`                    | `127.0.0.1`, `8090` | TCP listener of the server                                                                                                                          |
+| `hosts`                           | `[]`                | Bootstrap list of `host:port`, tried round-robin with fall-through; overrides `host`/`port`                                                         |
+| `username`, `password`            | `iggy`, `iggy`      | Credentials every connection logs in with                                                                                                           |
+| `ioThreads`                       | `min(8, cores)`     | Netty event loop threads shared by every connection of the worker; `0` = one loop per connection                                                    |
+| `connectionTimeoutMs`             | `3000`              | Dial timeout of every connection                                                                                                                    |
+| `requestTimeoutMs`                | `30000`             | Time a request may wait for its reply; bounds how late a dropped request fails                                                                      |
+| `retryPolicy`                     | `default`           | Redial after a lost connection: `default` (12 attempts 5 s apart), `none`, `exponential`, `fixed`                                                   |
+| `retryMaxRetries`, `retryDelayMs` | `12`, `5000`        | Attempts and delay for `retryPolicy: fixed`                                                                                                         |
+| `streamName`                      | `omb`               | Stream holding the benchmark topics, created when missing                                                                                           |
+| `topicOptions`                    | `{}`                | Options passed at CreateTopic, keyed by server option name, values as strings                                                                       |
+| `producerBatchSize`               | `1000`              | Flush a batch once it holds this many messages                                                                                                      |
+| `producerBatchBytes`              | `1048576`           | Flush a batch once its payloads reach this many bytes                                                                                               |
+| `producerLingerMs`                | `1`                 | Flush open batches this often, whatever their size                                                                                                  |
+| `producerMaxInFlightBatches`      | `16`                | Batches a producer may have in flight before `sendAsync` blocks; `0` = no cap                                                                       |
+| `consumerPollSize`                | `1000`              | Maximum number of messages one poll asks for                                                                                                        |
+| `consumerAutoCommit`              | `true`              | `true`: the server stores the group offset after every poll. `false`: the consumer keeps a cursor per owned partition and stores the offsets itself |
+| `consumerCommitIntervalMs`        | `0`                 | With `consumerAutoCommit: false`, the shortest time between two offset stores of one partition. `0` stores after every non-empty poll               |
 
 Unknown keys fail the run at start-up (the framework's `name` and `driverClass` are tolerated), so a
 misspelled key cannot silently run with the default.
@@ -96,9 +98,17 @@ misspelled key cannot silently run with the default.
   1000-message, 1 MiB batches the cap is 16 MiB per producer.
 * Every consumer owns one connection and one poll thread. The consumers of one subscription form one
   Iggy consumer group named after the subscription, so every subscription receives every message.
-  Polls use `PollingStrategy.next()` with auto-commit. One poll serves one partition of the member's
-  assignment, so the loop backs off only after a full empty cycle. End-to-end latency is
-  `now - originTimestamp / 1000` in milliseconds.
+  With `consumerAutoCommit: true` polls use `PollingStrategy.next()` with auto-commit. The server
+  picks one partition of the member's assignment per poll and stores the group offset after it.
+  On a replicated topic that store is one consensus operation per non-empty poll. With `false`
+  the consumer reads its assignment with the sync-consumer-group command, which the server answers
+  for the calling connection. It re-reads it every 5 s, after a poll failure and after a fenced
+  poll (an empty poll with the re-sync sentinel as partition id, sent while a rebalance moves the
+  partition). It keeps a cursor per owned partition and polls each by explicit offset. It stores the
+  offset itself, at most once per `consumerCommitIntervalMs` per partition and once on close. A
+  fresh cursor starts after the group's stored offset, or at 0. In both modes the loop backs off
+  only after a full empty cycle. End-to-end latency is `now - originTimestamp / 1000` in
+  milliseconds.
 
 ## Notes
 

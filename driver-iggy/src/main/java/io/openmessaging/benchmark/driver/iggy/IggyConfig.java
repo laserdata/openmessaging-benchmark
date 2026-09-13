@@ -111,4 +111,10 @@ public class IggyConfig {
 
     /** Maximum number of messages one consumer poll asks for. */
     public int consumerPollSize = 1000;
+    // true: the server stores the group offset after every poll (one replicated operation
+    // per non-empty poll). false: the consumer keeps its own cursor per owned partition and
+    // stores the offset itself, at most once per consumerCommitIntervalMs per partition
+    // (0 = after every non-empty poll, the Kafka driver's commitAsync shape).
+    public boolean consumerAutoCommit = true;
+    public long consumerCommitIntervalMs = 0;
 }
