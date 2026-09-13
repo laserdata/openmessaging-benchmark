@@ -100,21 +100,75 @@ public class IggyConfig {
     /** A producer batch is flushed once its payloads reach this many bytes. */
     public long producerBatchBytes = 1024 * 1024;
 
-    /** Open producer batches are flushed this often, whatever their size. */
+    /**
+     * How long an open producer batch waits for more messages before it is sent, whatever its size.
+     * The deadline runs from the batch's first message, so a bucket taking a steady trickle cannot
+     * postpone its own flush.
+     */
     public long producerLingerMs = 1;
 
-    /**
-     * Batches a producer may have in flight before {@code sendAsync} blocks the worker's load thread,
-     * which is the driver's backpressure. 0 disables the cap.
-     */
+    /** Batches a producer may have in flight before its send lane stops. 0 disables the cap. */
     public int producerMaxInFlightBatches = 16;
+
+    /**
+     * Bytes a producer may hold unacknowledged, across open, queued and in-flight batches, before
+     * {@code sendAsync} blocks the worker's load thread. That block is the driver's backpressure.
+     *
+     * <p>A batch count alone does not bound memory. At 100 topics of 3 MB/s each batch closes on the
+     * linger deadline holding a few kilobytes, so the in-flight cap is reached with a small fraction
+     * of the memory the same cap permits when batches are full. 0 disables the budget and leaves the
+     * batch count as the only bound. Negative derives it as {@link #producerMaxInFlightBatches} whole
+     * batches, which is what the batch cap already implies once batches fill.
+     */
+    public long producerMaxPendingBytes = -1;
+
+    /**
+     * Threads shared by every producer in this worker for encoding and submitting batches.
+     *
+     * <p>The linger timer only moves a batch onto its producer's send queue, so this pool is where
+     * the per-batch work actually runs. Sizing it below the core count is deliberate: the Netty loops
+     * and the worker's load threads need the rest.
+     */
+    public int producerFlushThreads = Math.min(4, Runtime.getRuntime().availableProcessors());
 
     /** Maximum number of messages one consumer poll asks for. */
     public int consumerPollSize = 1000;
+
+    /**
+     * Polls one consumer may have in flight, across distinct partitions and never more than one per
+     * partition. 1 reproduces the original one-at-a-time sweep.
+     *
+     * <p>A consumer owning P partitions and polling them one at a time revisits each once per P round
+     * trips, so a message arriving just after its partition was visited waits most of a sweep.
+     * Raising this shortens the revisit interval without changing what a single poll asks for, which
+     * is the client half of the partition-count latency growth.
+     */
+    public int consumerPollConcurrency = 1;
+
     // true: the server stores the group offset after every poll (one replicated operation
     // per non-empty poll). false: the consumer keeps its own cursor per owned partition and
     // stores the offset itself, at most once per consumerCommitIntervalMs per partition
     // (0 = after every non-empty poll, the Kafka driver's commitAsync shape).
     public boolean consumerAutoCommit = true;
     public long consumerCommitIntervalMs = 0;
+
+    /**
+     * {@link #producerMaxPendingBytes} with the negative "derive it" case resolved.
+     *
+     * @return the byte budget one producer may hold unacknowledged, or 0 when unbounded
+     */
+    long resolvedMaxPendingBytes() {
+        if (producerMaxPendingBytes >= 0) {
+            return producerMaxPendingBytes;
+        }
+        if (producerMaxInFlightBatches <= 0) {
+            return 0;
+        }
+        try {
+            return Math.multiplyExact(Math.max(1, producerBatchBytes), producerMaxInFlightBatches);
+        } catch (ArithmeticException error) {
+            throw new IllegalArgumentException(
+                    "Derived producer byte budget exceeds signed 64-bit range", error);
+        }
+    }
 }
