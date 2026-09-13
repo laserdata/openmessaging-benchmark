@@ -54,9 +54,24 @@ producerBatchSize: 1000
 producerBatchBytes: 1048576
 producerLingerMs: 1
 
-# Batches a producer may have in flight before sendAsync blocks the load thread.
-# 0 disables the cap (unbounded memory under producerRate: 0).
+# Batches a producer may have in flight before its send lane stops. 0 disables the cap.
 producerMaxInFlightBatches: 16
+
+# Bytes a producer may hold unacknowledged, across open, queued and in-flight batches, before
+# sendAsync blocks the load thread. A batch count alone does not bound memory: with many topics
+# a batch closes on the linger deadline holding a few KB, so the in-flight cap is reached far
+# below the memory it allows when batches are full. Negative derives it from
+# producerMaxInFlightBatches whole batches, 0 disables it.
+# producerMaxPendingBytes: -1
+
+# Threads shared by every producer for encoding and submitting batches. The linger timer only
+# hands a batch to its producer's lane, so this is where the per-batch work runs.
+# Omit for min(4, cores).
+# producerFlushThreads: 4
 
 # Maximum number of messages one poll asks for.
 consumerPollSize: 1000
+
+# Polls one consumer may have in flight, at most one per owned partition. 1 is the original
+# one-at-a-time sweep, where a consumer owning P partitions revisits each once per P round trips.
+# consumerPollConcurrency: 1
