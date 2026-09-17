@@ -153,6 +153,28 @@ public class IggyConfig {
     public long consumerCommitIntervalMs = 0;
 
     /**
+     * How long the server may hold a poll that has nothing to return, in milliseconds. 0 polls
+     * immediately and returns whatever is resident, which costs one request per empty result and one
+     * idle backoff before the next attempt.
+     *
+     * <p>Above 0 the consumer issues a deferred poll instead: the server holds it until {@link
+     * #consumerDeferredMinCount} messages are readable, the byte cap prevents selecting more, or this
+     * wait expires. It needs a server that answers command 105; an older one fails the poll with
+     * {@code InvalidCommand} and the driver does not fall back.
+     */
+    public long consumerDeferredMaxWaitMs = 0;
+
+    /** Messages that make a deferred poll ready. Never more than {@link #consumerPollSize}. */
+    public long consumerDeferredMinCount = 1;
+
+    /**
+     * Cap on the encoded body of a deferred poll response, including framing but not the transport
+     * header. A smaller reply than {@link #consumerPollSize} messages is normal; the cursor advances
+     * by what arrived. The server's own read cap (16 MiB by default) still applies.
+     */
+    public long consumerDeferredMaxBytes = 4L * 1024 * 1024;
+
+    /**
      * {@link #producerMaxPendingBytes} with the negative "derive it" case resolved.
      *
      * @return the byte budget one producer may hold unacknowledged, or 0 when unbounded

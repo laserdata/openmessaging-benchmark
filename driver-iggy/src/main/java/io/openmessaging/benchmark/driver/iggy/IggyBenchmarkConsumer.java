@@ -17,6 +17,7 @@ package io.openmessaging.benchmark.driver.iggy;
 import io.openmessaging.benchmark.driver.BenchmarkConsumer;
 import io.openmessaging.benchmark.driver.ConsumerCallback;
 import java.math.BigInteger;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -39,6 +40,7 @@ import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
@@ -86,6 +88,11 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
     private final long pollSize;
     private final int pollConcurrency;
     private final boolean autoCommit;
+    /** Readiness and response limits of a deferred poll, null when polls return immediately. */
+    private final DeferredPollOptions deferredOptions;
+    /** Pause after an empty reply. Zero once the server does the waiting. */
+    private final long emptyPollBackoffNanos;
+
     private final long commitIntervalNanos;
     private final ConsumerCallback callback;
     private final Thread pollThread;
@@ -138,11 +145,37 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
         this.pollConcurrency = Math.max(1, config.consumerPollConcurrency);
         this.completions = new ArrayBlockingQueue<>(pollConcurrency);
         this.autoCommit = config.consumerAutoCommit;
+        this.deferredOptions = deferredOptions(config, this.pollSize);
+        this.emptyPollBackoffNanos = this.deferredOptions == null ? IDLE_BACKOFF_NANOS : 0;
         this.commitIntervalNanos =
                 TimeUnit.MILLISECONDS.toNanos(Math.max(0, config.consumerCommitIntervalMs));
         this.callback = callback;
         this.pollThread = new Thread(this::pollLoop, "iggy-consumer-" + topicId + "-" + groupId);
         this.pollThread.setDaemon(true);
+    }
+
+    /**
+     * Builds the deferred poll limits from the driver config, or returns null when the run polls
+     * immediately. The request budget is the readiness wait plus the driver's request timeout: the
+     * wait is expected, everything after it is the ordinary round trip. A limit the server cannot
+     * honour fails here, at consumer creation, rather than on every poll of the run.
+     *
+     * @param config the driver settings of this run
+     * @param pollSize the message count one poll asks for, which bounds the readiness minimum
+     * @return the limits every poll of this consumer carries, or null for immediate polls
+     */
+    private static DeferredPollOptions deferredOptions(IggyConfig config, long pollSize) {
+        if (config.consumerDeferredMaxWaitMs <= 0) {
+            return null;
+        }
+        DeferredPollOptions options =
+                new DeferredPollOptions(
+                        Duration.ofMillis(config.consumerDeferredMaxWaitMs),
+                        config.consumerDeferredMinCount,
+                        config.consumerDeferredMaxBytes,
+                        Duration.ofMillis(config.consumerDeferredMaxWaitMs + config.requestTimeoutMs));
+        options.validate(pollSize);
+        return options;
     }
 
     void start() {
@@ -163,23 +196,12 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
         long emptyPolls = 0;
         while (!closed.get()) {
             try {
-                PolledMessages polled =
-                        client
-                                .messages()
-                                .pollMessages(
-                                        streamId,
-                                        topicId,
-                                        Optional.empty(),
-                                        consumer,
-                                        PollingStrategy.next(),
-                                        pollSize,
-                                        true)
-                                .get();
+                PolledMessages polled = sendPoll(Optional.empty(), PollingStrategy.next()).get();
                 if (polled.messages().isEmpty()) {
                     emptyPolls++;
                     if (emptyPolls >= partitionsCount) {
                         emptyPolls = 0;
-                        LockSupport.parkNanos(IDLE_BACKOFF_NANOS);
+                        LockSupport.parkNanos(emptyPollBackoffNanos);
                     }
                     continue;
                 }
@@ -290,16 +312,7 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
         CompletableFuture<PolledMessages> poll;
         try {
             poll =
-                    client
-                            .messages()
-                            .pollMessages(
-                                    streamId,
-                                    topicId,
-                                    Optional.of(partition),
-                                    consumer,
-                                    PollingStrategy.offset(BigInteger.valueOf(cursor.next)),
-                                    pollSize,
-                                    false);
+                    sendPoll(Optional.of(partition), PollingStrategy.offset(BigInteger.valueOf(cursor.next)));
         } catch (RuntimeException e) {
             enqueueCompletion(new Completion(generation, requestId, partition, null, e));
             return;
@@ -307,6 +320,35 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
         poll.whenComplete(
                 (polled, error) ->
                         enqueueCompletion(new Completion(generation, requestId, partition, polled, error)));
+    }
+
+    /**
+     * Issues one poll. With {@code consumerDeferredMaxWaitMs} above 0 the server holds the request
+     * until it has messages, so an empty reply means the readiness wait expired rather than that the
+     * partition was empty at the moment the request arrived.
+     *
+     * @param partitionId the partition to read, empty to let the server pick an owned one
+     * @param strategy where in the partition the read starts
+     * @return the reply, completed exceptionally when the poll fails
+     */
+    private CompletableFuture<PolledMessages> sendPoll(
+            Optional<Long> partitionId, PollingStrategy strategy) {
+        if (deferredOptions == null) {
+            return client
+                    .messages()
+                    .pollMessages(streamId, topicId, partitionId, consumer, strategy, pollSize, autoCommit);
+        }
+        return client
+                .messages()
+                .pollMessagesDeferred(
+                        streamId,
+                        topicId,
+                        partitionId,
+                        consumer,
+                        strategy,
+                        pollSize,
+                        autoCommit,
+                        deferredOptions);
     }
 
     private void enqueueCompletion(Completion completion) {
@@ -377,7 +419,7 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
                 cursor.eligibleAtNanos = System.nanoTime() + ERROR_BACKOFF_NANOS;
                 return;
             }
-            cursor.eligibleAtNanos = System.nanoTime() + IDLE_BACKOFF_NANOS;
+            cursor.eligibleAtNanos = System.nanoTime() + emptyPollBackoffNanos;
             return;
         }
         cursor.eligibleAtNanos = System.nanoTime();

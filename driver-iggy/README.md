@@ -64,6 +64,9 @@ transport, through the Java SDK (`org.apache.iggy:iggy`).
 | `consumerPollSize`                | `1000`              | Maximum number of messages one poll asks for                                                                                                        |
 | `consumerAutoCommit`              | `true`              | `true`: the server stores the group offset after every poll. `false`: the consumer keeps a cursor per owned partition and stores the offsets itself |
 | `consumerCommitIntervalMs`        | `0`                 | With `consumerAutoCommit: false`, the shortest time between two offset stores of one partition. `0` stores after every non-empty poll               |
+| `consumerDeferredMaxWaitMs`       | `0`                 | Milliseconds the server may hold a poll that has nothing to return. `0` polls immediately; above `0` needs a server that answers command 105        |
+| `consumerDeferredMinCount`        | `1`                 | With a readiness wait, the messages that make one poll ready                                                                                        |
+| `consumerDeferredMaxBytes`        | `4194304`           | With a readiness wait, the cap on the encoded response body of one poll, in bytes                                                                   |
 
 Unknown keys fail the run at start-up (the framework's `name` and `driverClass` are tolerated), so a
 misspelled key cannot silently run with the default.

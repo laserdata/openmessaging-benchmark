@@ -75,3 +75,14 @@ consumerPollSize: 1000
 # Polls one consumer may have in flight, at most one per owned partition. 1 is the original
 # one-at-a-time sweep, where a consumer owning P partitions revisits each once per P round trips.
 # consumerPollConcurrency: 1
+
+# How long the server may hold a poll that has nothing to return, in milliseconds. 0 polls
+# immediately, which costs one request per empty result plus an idle backoff before the next
+# attempt. Above 0 the consumer issues a deferred poll, which needs a server that answers
+# command 105; an older one fails the poll instead of falling back.
+# consumerDeferredMaxWaitMs: 0
+
+# Messages that make a deferred poll ready, and the cap on its encoded response body. Only read
+# when consumerDeferredMaxWaitMs is above 0.
+# consumerDeferredMinCount: 1
+# consumerDeferredMaxBytes: 4194304

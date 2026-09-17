@@ -22,12 +22,15 @@ import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import io.openmessaging.benchmark.driver.ConsumerCallback;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.math.BigInteger;
+import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
@@ -51,6 +54,7 @@ import org.apache.iggy.consumergroup.ConsumerGroupAssignment;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.MessageHeader;
 import org.apache.iggy.message.MessageId;
@@ -329,6 +333,33 @@ class IggyBenchmarkConcurrencyTest {
     }
 
     @Test
+    void aReadinessWaitSendsDeferredPollsCarryingTheConfiguredLimits() throws Exception {
+        ConsumerFixture fixture = new ConsumerFixture(1, List.of(0L), 100);
+        fixture.refresh();
+        invoke(fixture.consumer, "issuePolls");
+        assertEquals(List.of(0L), fixture.polledPartitions);
+        assertEquals(1, fixture.deferredOptions.size());
+        DeferredPollOptions options = fixture.deferredOptions.get(0);
+        assertEquals(Duration.ofMillis(100), options.maxWait());
+        assertEquals(1, options.minCount());
+        // The wait is inside the request budget, so a poll held for it is not a late reply.
+        assertEquals(
+                Duration.ofMillis(100 + new IggyConfig().requestTimeoutMs), options.requestTimeout());
+        verify(fixture.messages, never())
+                .pollMessages(
+                        any(StreamId.class), any(TopicId.class), any(), any(), any(), anyLong(), anyBoolean());
+    }
+
+    @Test
+    void pollsReturnImmediatelyUnlessAReadinessWaitIsConfigured() throws Exception {
+        ConsumerFixture fixture = new ConsumerFixture(1, List.of(0L));
+        fixture.refresh();
+        invoke(fixture.consumer, "issuePolls");
+        assertEquals(List.of(0L), fixture.polledPartitions);
+        assertTrue(fixture.deferredOptions.isEmpty());
+    }
+
+    @Test
     void authoritativeGenerationChangesEvenWithIdenticalPartitionAssignment() throws Exception {
         ConsumerFixture fixture = new ConsumerFixture(1, List.of(0L));
         fixture.refresh();
@@ -466,12 +497,18 @@ class IggyBenchmarkConcurrencyTest {
         final List<BigInteger> storedOffsets = new ArrayList<>();
         final List<CompletableFuture<Void>> commits = new ArrayList<>();
         final List<Integer> delivered = new ArrayList<>();
+        final List<DeferredPollOptions> deferredOptions = new ArrayList<>();
         long generation;
 
         ConsumerFixture(int concurrency, List<Long> partitions) {
+            this(concurrency, partitions, 0);
+        }
+
+        ConsumerFixture(int concurrency, List<Long> partitions, long deferredMaxWaitMs) {
             IggyConfig config = new IggyConfig();
             config.consumerPollConcurrency = concurrency;
             config.consumerAutoCommit = false;
+            config.consumerDeferredMaxWaitMs = deferredMaxWaitMs;
             when(client.messages()).thenReturn(messages);
             when(client.consumerGroups()).thenReturn(groups);
             when(client.consumerOffsets()).thenReturn(offsets);
@@ -502,13 +539,20 @@ class IggyBenchmarkConcurrencyTest {
                             any(),
                             anyLong(),
                             anyBoolean()))
+                    .thenAnswer(call -> recordPoll(call.getArgument(2)));
+            when(messages.pollMessagesDeferred(
+                            any(StreamId.class),
+                            any(TopicId.class),
+                            any(),
+                            any(),
+                            any(),
+                            anyLong(),
+                            anyBoolean(),
+                            any()))
                     .thenAnswer(
                             call -> {
-                                Optional<Long> partition = call.getArgument(2);
-                                polledPartitions.add(partition.orElseThrow());
-                                CompletableFuture<PolledMessages> poll = new CompletableFuture<>();
-                                polls.add(poll);
-                                return poll;
+                                deferredOptions.add(call.getArgument(7));
+                                return recordPoll(call.getArgument(2));
                             });
             ConsumerCallback callback = mock(ConsumerCallback.class);
             doAnswer(
@@ -522,6 +566,13 @@ class IggyBenchmarkConcurrencyTest {
             consumer =
                     new IggyBenchmarkConsumer(
                             client, STREAM, TOPIC, ConsumerId.of(1L), partitions.size(), config, callback);
+        }
+
+        private CompletableFuture<PolledMessages> recordPoll(Optional<Long> partition) {
+            polledPartitions.add(partition.orElseThrow());
+            CompletableFuture<PolledMessages> poll = new CompletableFuture<>();
+            polls.add(poll);
+            return poll;
         }
 
         void refresh() throws Exception {
