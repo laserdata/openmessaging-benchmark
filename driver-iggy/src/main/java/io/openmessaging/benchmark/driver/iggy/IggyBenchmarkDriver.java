@@ -40,8 +40,10 @@ import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -51,6 +53,7 @@ import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientBuilder;
 import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.exception.IggyConflictException;
 import org.apache.iggy.exception.IggyResourceNotFoundException;
+import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
@@ -71,6 +74,9 @@ import org.slf4j.LoggerFactory;
 public class IggyBenchmarkDriver implements BenchmarkDriver {
 
     private static final Logger log = LoggerFactory.getLogger(IggyBenchmarkDriver.class);
+    // Mirrors IggyError::ConsumerGroupPartitionNotOwned in the server. The SDK's IggyErrorCode has
+    // no entry for it yet, so the raw code is matched.
+    private static final int CONSUMER_GROUP_PARTITION_NOT_OWNED = 5009;
 
     private static final ObjectMapper mapper =
             new ObjectMapper(new YAMLFactory())
@@ -86,6 +92,13 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
     private AsyncIggyTcpClient admin;
     private ScheduledExecutorService lingerExecutor;
 
+    /**
+     * Where every producer encodes and submits its batches. Shared and bounded: the linger timer only
+     * hands a batch to its producer's lane, so this is the pool that does the per-batch work one
+     * thread used to do for every producer in the worker at once.
+     */
+    private ExecutorService flushExecutor;
+
     /** Shared by every connection; null when {@code ioThreads} is 0. */
     private IoEventLoopGroup ioGroup;
 
@@ -99,6 +112,19 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
     @Override
     public void initialize(File configurationFile, StatsLogger statsLogger) throws IOException {
         config = mapper.readValue(configurationFile, IggyConfig.class);
+        long maxPendingBytes = config.resolvedMaxPendingBytes();
+        if (config.producerFlushThreads < 1 || config.consumerPollConcurrency < 1) {
+            throw new IllegalArgumentException(
+                    "Producer flush threads and consumer poll concurrency must be positive");
+        }
+        if (maxPendingBytes == 0) {
+            log.warn(
+                    "Producer byte backpressure is disabled (producerMaxPendingBytes={},"
+                            + " producerMaxInFlightBatches={}); queued messages are unbounded and"
+                            + " producerRate: 0 can exhaust the heap",
+                    config.producerMaxPendingBytes,
+                    config.producerMaxInFlightBatches);
+        }
         streamId = StreamId.of(config.streamName);
         endpoints = endpoints(config);
         retryPolicy = retryPolicy(config);
@@ -110,13 +136,29 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
                             thread.setDaemon(true);
                             return thread;
                         });
+        flushExecutor =
+                Executors.newFixedThreadPool(
+                        Math.max(1, config.producerFlushThreads),
+                        new ThreadFactory() {
+                            private final AtomicInteger next = new AtomicInteger();
+
+                            @Override
+                            public Thread newThread(Runnable runnable) {
+                                Thread thread =
+                                        new Thread(runnable, "iggy-producer-flush-" + next.getAndIncrement());
+                                thread.setDaemon(true);
+                                return thread;
+                            }
+                        });
         ioGroup = ioGroup(config);
         admin = connect().join();
         ensureStream();
         log.info(
                 "Iggy driver initialized: endpoints={} ioThreads={} stream={} connectionTimeoutMs={}"
                         + " requestTimeoutMs={} retryPolicy={} topicOptions={} batchSize={} batchBytes={}"
-                        + " lingerMs={} maxInFlightBatches={} pollSize={} autoCommit={}"
+                        + " lingerMs={} maxInFlightBatches={} maxPendingBytes={} flushThreads={}"
+                        + " pollSize={} configuredPollConcurrency={} effectivePollConcurrency={}"
+                        + " autoCommit={}"
                         + " commitIntervalMs={}",
                 endpoints,
                 config.ioThreads,
@@ -129,7 +171,11 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
                 config.producerBatchBytes,
                 config.producerLingerMs,
                 config.producerMaxInFlightBatches,
+                maxPendingBytes,
+                config.producerFlushThreads,
                 config.consumerPollSize,
+                config.consumerPollConcurrency,
+                config.effectiveConsumerPollConcurrency(),
                 config.consumerAutoCommit,
                 config.consumerCommitIntervalMs);
     }
@@ -312,14 +358,16 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
     private CompletableFuture<BenchmarkProducer> openProducer(
             AsyncIggyTcpClient client, TopicId topicId) {
         return partitionsCount(client, topicId)
-                .thenApply(
-                        partitions -> {
-                            IggyBenchmarkProducer producer =
-                                    new IggyBenchmarkProducer(
-                                            client, streamId, topicId, partitions, config, lingerExecutor);
-                            producers.add(producer);
-                            return producer;
-                        });
+                .thenApply(partitions -> newProducer(client, topicId, partitions));
+    }
+
+    private BenchmarkProducer newProducer(
+            AsyncIggyTcpClient client, TopicId topicId, long partitions) {
+        IggyBenchmarkProducer producer =
+                new IggyBenchmarkProducer(
+                        client, streamId, topicId, partitions, config, lingerExecutor, flushExecutor);
+        producers.add(producer);
+        return producer;
     }
 
     @Override
@@ -346,6 +394,7 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
                                     new IggyBenchmarkConsumer(
                                             client, streamId, topicId, groupId, partitions, config, callback);
                             consumers.add(consumer);
+                            consumer.start();
                             return consumer;
                         });
     }
@@ -410,6 +459,10 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
         if (lingerExecutor != null) {
             lingerExecutor.shutdownNow();
         }
+        // After the producers, whose close() drains their own lanes through it.
+        if (flushExecutor != null) {
+            flushExecutor.shutdownNow();
+        }
         if (admin != null) {
             for (String topic : new ArrayList<>(createdTopics)) {
                 awaitQuietly(
@@ -465,6 +518,17 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
 
     static boolean isNotFound(Throwable error) {
         return unwrap(error) instanceof IggyResourceNotFoundException;
+    }
+
+    /**
+     * Whether the server refused a consumer group request because another member owns the partition.
+     *
+     * @param error the failure, possibly wrapped in completion or execution exceptions
+     * @return true when the server answered {@code ConsumerGroupPartitionNotOwned}
+     */
+    static boolean isNotOwned(Throwable error) {
+        return unwrap(error) instanceof IggyServerException server
+                && server.getRawErrorCode() == CONSUMER_GROUP_PARTITION_NOT_OWNED;
     }
 
     static Throwable unwrap(Throwable error) {

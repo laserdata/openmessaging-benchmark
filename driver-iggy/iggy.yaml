@@ -48,15 +48,32 @@ streamName: omb
 # segment_size=1GiB). See iggy-fsync.yaml for the durable cell.
 topicOptions: {}
 
-# A producer batch is flushed when it reaches producerBatchSize messages or
-# producerBatchBytes bytes of payload, or when producerLingerMs elapsed.
+# A batch becomes ready at producerBatchSize messages, producerBatchBytes bytes of payload,
+# or producerLingerMs after its first message. If sending is blocked, a partial batch can keep filling.
 producerBatchSize: 1000
 producerBatchBytes: 1048576
 producerLingerMs: 1
 
-# Batches a producer may have in flight before sendAsync blocks the load thread.
-# 0 disables the cap (unbounded memory under producerRate: 0).
+# Batches a producer may have in flight before its send lane stops. Ready batches can still queue;
+# this controls network concurrency, not accepted-data backpressure. 0 disables the cap.
 producerMaxInFlightBatches: 16
+
+# Bytes a producer can hold without acknowledgment before sendAsync blocks the load thread.
+# The charge includes payloads and message headers across open, queued, and sent batches.
+# A negative value reserves producerBatchBytes plus producerBatchSize headers for each allowed
+# in-flight batch. With producerMaxInFlightBatches: 0 it resolves to 0. A resolved value of 0
+# disables backpressure and can grow memory without bound under producerRate: 0.
+# producerMaxPendingBytes: -1
+
+# Threads shared by every producer for encoding and submitting batches. The linger timer only
+# hands a batch to its producer's lane, so this is where the per-batch work runs.
+# Omit for min(4, cores).
+# producerFlushThreads: 4
 
 # Maximum number of messages one poll asks for.
 consumerPollSize: 1000
+
+# With consumerAutoCommit: false, polls one consumer may have in flight, at most one per owned
+# partition. 1 is the original one-at-a-time sweep, where a consumer owning P partitions revisits
+# each once per P round trips. Server-cursor mode (consumerAutoCommit: true) always polls serially.
+# consumerPollConcurrency: 1

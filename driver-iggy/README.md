@@ -59,9 +59,12 @@ transport, through the Java SDK (`org.apache.iggy:iggy`).
 | `topicOptions`                    | `{}`                | Options passed at CreateTopic, keyed by server option name, values as strings                                                                       |
 | `producerBatchSize`               | `1000`              | Flush a batch once it holds this many messages                                                                                                      |
 | `producerBatchBytes`              | `1048576`           | Flush a batch once its payloads reach this many bytes                                                                                               |
-| `producerLingerMs`                | `1`                 | Flush open batches this often, whatever their size                                                                                                  |
-| `producerMaxInFlightBatches`      | `16`                | Batches a producer may have in flight before `sendAsync` blocks; `0` = no cap                                                                       |
+| `producerLingerMs`                | `1`                 | Time in milliseconds from the first message until a batch becomes ready to send. A blocked batch can keep filling.                                  |
+| `producerMaxInFlightBatches`      | `16`                | Maximum batch requests awaiting replies per producer. Ready batches may queue behind this limit; `0` disables it.                                   |
+| `producerMaxPendingBytes`         | `-1`                | Accepted-byte limit before `sendAsync` blocks. Negative derives a full charged-batch budget from the batch limits; `0` disables backpressure.       |
+| `producerFlushThreads`            | `min(4, cores)`     | Threads shared by the worker's producers for encoding and submitting ready batches                                                                  |
 | `consumerPollSize`                | `1000`              | Maximum number of messages one poll asks for                                                                                                        |
+| `consumerPollConcurrency`         | `1`                 | Concurrent partition polls with `consumerAutoCommit: false`; ignored by serial server-cursor polling when auto-commit is enabled                    |
 | `consumerAutoCommit`              | `true`              | `true`: the server stores the group offset after every poll. `false`: the consumer keeps a cursor per owned partition and stores the offsets itself |
 | `consumerCommitIntervalMs`        | `0`                 | With `consumerAutoCommit: false`, the shortest time between two offset stores of one partition. `0` stores after every non-empty poll               |
 
@@ -84,18 +87,21 @@ misspelled key cannot silently run with the default.
   or value the server refuses fails the run at topic creation.
 * Every producer owns one connection. `sendAsync` stamps `originTimestamp` with the current wall
   clock in microseconds, buffers the message and flushes by size, bytes or linger as one
-  `sendMessages` call. Messages without a key go with `Partitioning.balanced()`, which the SDK
-  resolves to one partition per batch, rotating; keyed messages are bucketed by
-  `xxh32(key) % partitions`, the mapping `Partitioning.messagesKey` uses, and each bucket is sent
-  with `Partitioning.partitionId`. A message future completes when its batch is acknowledged, which
-  means committed to the replicated log and visible to consumers (fsynced as well with the fsync
-  options).
-* Backpressure. At most `producerMaxInFlightBatches` batches are in flight per producer. A full
-  batch blocks the worker's load thread until a permit is free, the same model as Kafka's
-  `buffer.memory` and Pulsar's `blockIfQueueFull`, so `producerRate: 0` (max-rate discovery) and an
-  overloaded server cannot grow the heap without bound. The shared linger thread never blocks: a
-  batch it cannot send stays open until the next tick or until it fills. With the default
-  1000-message, 1 MiB batches the cap is 16 MiB per producer.
+  `sendMessages` call. Messages without a key rotate across partitions once per batch; keyed
+  messages are bucketed by `xxh32(key) % partitions`, the mapping `Partitioning.messagesKey` uses.
+  Both paths send with `Partitioning.partitionId`. A message future completes when its batch is
+  acknowledged, which means committed to the replicated log and visible to consumers (fsynced as
+  well with the fsync options).
+* Backpressure limits how much data the producer accepts before replies arrive. The producer blocks
+  the load thread when another message exceeds `producerMaxPendingBytes`; the budget counts payloads
+  and message headers in open, queued, and sent batches. It is the accepted-data bound because
+  `producerMaxInFlightBatches` only limits requests awaiting replies and ready batches can queue
+  behind it. The default derived budget covers 16 configured payload budgets plus up to 1000 headers
+  per batch (about 16.7 MiB per producer). A resolved byte budget of 0 is unbounded and logs a warning.
+* The linger timer marks a batch as ready to send after `producerLingerMs` from its first message.
+  If sending is blocked, the batch can accept more messages until it reaches the message or byte limit.
+  Once the sender takes the batch, new messages enter a new batch.
+  If a send slot is available, the sender can send a partial batch after its deadline.
 * Every consumer owns one connection and one poll thread. The consumers of one subscription form one
   Iggy consumer group named after the subscription, so every subscription receives every message.
   With `consumerAutoCommit: true` polls use `PollingStrategy.next()` with auto-commit. The server
@@ -104,11 +110,14 @@ misspelled key cannot silently run with the default.
   the consumer reads its assignment with the sync-consumer-group command, which the server answers
   for the calling connection. It re-reads it every 5 s, after a poll failure and after a fenced
   poll (an empty poll with the re-sync sentinel as partition id, sent while a rebalance moves the
-  partition). It keeps a cursor per owned partition and polls each by explicit offset. It stores the
-  offset itself, at most once per `consumerCommitIntervalMs` per partition and once on close. A
-  fresh cursor starts after the group's stored offset, or at 0. In both modes the loop backs off
-  only after a full empty cycle. End-to-end latency is `now - originTimestamp / 1000` in
-  milliseconds.
+  partition). It keeps a cursor per owned partition and polls each by explicit offset, with up to
+  `consumerPollConcurrency` requests in flight. It stores the offset itself, at most once per
+  `consumerCommitIntervalMs` per partition and once on close. A fresh cursor starts after the
+  group's stored offset, or at 0. When the server refuses the offset of a revoked partition as not
+  owned, the consumer drops that cursor. It also drops the cursor when the store does not settle
+  within 10 s. The next owner then replays from the last stored offset. Server-cursor mode backs
+  off after a partition-count run of empty polls; client-cursor mode backs off each empty partition
+  independently. End-to-end latency is `now - originTimestamp / 1000` in milliseconds.
 
 ## Notes
 
@@ -122,9 +131,10 @@ misspelled key cannot silently run with the default.
   `eventLoopGroup(...)`, needs `0.9.0-SNAPSHOT` build 20 or newer). The loops only do socket I/O
   and frame decoding: producing runs on the worker's load threads and every consumer has its own
   poll thread, so the thread count no longer grows with producers plus consumers. Completion
-  callbacks run on the shared loops, which is why the producer never blocks inside one; the
-  in-flight permit is taken on the load thread before a batch is sent. `ioThreads: 0` falls back to
-  the SDK default of one single-thread loop per connection.
+  callbacks run on the shared loops and never block. `sendAsync` applies the byte budget on the
+  load thread; the flush pool takes available in-flight permits and submits ready batches, while the
+  linger thread only marks expired batches ready. `ioThreads: 0` falls back to the SDK default of
+  one single-thread loop per connection.
 * In a cluster every login converges on the metadata leader: the SDK fetches the roster after login
   and retargets the connection, and at view 0 every partition's primary is replica 0. In a healthy
   run all client traffic therefore lands on one node and the followers only replicate. `hosts` buys

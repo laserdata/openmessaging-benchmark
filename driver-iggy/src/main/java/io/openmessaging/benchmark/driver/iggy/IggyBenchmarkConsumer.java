@@ -19,13 +19,12 @@ import io.openmessaging.benchmark.driver.ConsumerCallback;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -62,8 +61,17 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
 
     private static final Logger log = LoggerFactory.getLogger(IggyBenchmarkConsumer.class);
 
-    private static final long IDLE_BACKOFF_NANOS = TimeUnit.MILLISECONDS.toNanos(1);
+    private static final long IDLE_BACKOFF_MILLIS = 1;
+    private static final long IDLE_BACKOFF_NANOS = TimeUnit.MILLISECONDS.toNanos(IDLE_BACKOFF_MILLIS);
     private static final long ERROR_BACKOFF_NANOS = TimeUnit.MILLISECONDS.toNanos(100);
+    /** How long an assignment refresh waits for outstanding polls to report back. */
+    private static final long DRAIN_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(10);
+    /**
+     * How long an assignment refresh waits for the offsets of revoked partitions to be stored before
+     * it drops their cursors and lets the next owner replay from the stored offset.
+     */
+    private static final long SETTLE_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(10);
+
     private static final long ASSIGNMENT_REFRESH_NANOS = TimeUnit.SECONDS.toNanos(5);
     private static final long CLOSE_TIMEOUT_SECONDS = 30;
     private static final long COMMIT_FAILURES_LOGGED_VERBATIM = 10;
@@ -79,18 +87,41 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
     private final Consumer consumer;
     private final long partitionsCount;
     private final long pollSize;
+    private final int pollConcurrency;
     private final boolean autoCommit;
     private final long commitIntervalNanos;
+    private final long settleTimeoutNanos;
     private final ConsumerCallback callback;
     private final Thread pollThread;
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final AtomicBoolean closeStarted = new AtomicBoolean();
+    private final Object completionLock = new Object();
 
     // Client-cursor mode. Owned by the poll thread; close() reads it after join().
     private List<Long> owned = List.of();
     private final Map<Long, Cursor> cursors = new HashMap<>();
     private boolean assignmentStale = true;
     private long assignmentRefreshDeadlineNanos;
-    private final Set<CompletableFuture<Void>> inFlightCommits = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Bumped whenever the owned set changes. Every issued poll carries the value it was issued under,
+     * so a reply that crosses a rebalance is recognised and dropped instead of delivering messages
+     * for a partition another member now owns.
+     */
+    private long assignmentGeneration;
+
+    private Long coordinatorGeneration;
+    private long nextPollId;
+
+    /** Partitions with a poll on the wire. At most one entry per partition. */
+    private final Map<Long, Long> inFlightPolls = new HashMap<>();
+
+    /** Index into {@link #owned} the next sweep starts at, so every partition gets a turn. */
+    private int sweepStart;
+
+    /** Replies waiting for the poll thread to apply them. */
+    private final BlockingQueue<Completion> completions;
+
     private final AtomicLong commitFailures = new AtomicLong();
 
     IggyBenchmarkConsumer(
@@ -101,6 +132,27 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
             long partitionsCount,
             IggyConfig config,
             ConsumerCallback callback) {
+        this(
+                client,
+                streamId,
+                topicId,
+                groupId,
+                partitionsCount,
+                config,
+                callback,
+                SETTLE_TIMEOUT_NANOS);
+    }
+
+    @SuppressWarnings("checkstyle:ParameterNumber")
+    IggyBenchmarkConsumer(
+            AsyncIggyTcpClient client,
+            StreamId streamId,
+            TopicId topicId,
+            ConsumerId groupId,
+            long partitionsCount,
+            IggyConfig config,
+            ConsumerCallback callback,
+            long settleTimeoutNanos) {
         this.client = client;
         this.streamId = streamId;
         this.topicId = topicId;
@@ -108,13 +160,19 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
         this.consumer = Consumer.group(groupId);
         this.partitionsCount = Math.max(1, partitionsCount);
         this.pollSize = Math.max(1, config.consumerPollSize);
+        this.pollConcurrency = config.effectiveConsumerPollConcurrency();
+        this.completions = new ArrayBlockingQueue<>(pollConcurrency);
         this.autoCommit = config.consumerAutoCommit;
         this.commitIntervalNanos =
                 TimeUnit.MILLISECONDS.toNanos(Math.max(0, config.consumerCommitIntervalMs));
+        this.settleTimeoutNanos = settleTimeoutNanos;
         this.callback = callback;
         this.pollThread = new Thread(this::pollLoop, "iggy-consumer-" + topicId + "-" + groupId);
         this.pollThread.setDaemon(true);
-        this.pollThread.start();
+    }
+
+    void start() {
+        pollThread.start();
     }
 
     private void pollLoop() {
@@ -166,59 +224,43 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
         }
     }
 
-    // Round-robin over the owned partitions, each polled by explicit offset from a local
-    // cursor. Nothing is stored on the server until maybeCommit decides to.
+    /**
+     * Polls the owned partitions by explicit offset from a local cursor, up to {@code
+     * consumerPollConcurrency} at a time and never more than one per partition. Nothing is stored on
+     * the server until {@link #maybeCommit} decides to.
+     *
+     * <p>This thread stays the only one that touches assignment, cursors and commits. Network
+     * completions do nothing but hand a result back through {@link #completions}, so concurrency
+     * changes how many requests are on the wire and nothing about who owns the state.
+     *
+     * <p>Every issued poll carries the assignment generation it was issued under. A rebalance bumps
+     * the generation, so a reply for a partition this member no longer owns is dropped before it can
+     * deliver messages or move a cursor that now belongs to someone else.
+     */
     private void pollWithClientCursor() {
-        long emptyPolls = 0;
-        int next = 0;
         while (!closed.get()) {
             try {
                 long now = System.nanoTime();
                 if (assignmentStale || now - assignmentRefreshDeadlineNanos >= 0) {
-                    refreshAssignment(now);
+                    // Wait for outstanding replies first: a refresh that revoked a
+                    // partition must not race the completion that would advance it.
+                    if (!drainInFlight()) {
+                        return;
+                    }
+                    // Re-read the clock: the drain can take longer than the refresh
+                    // interval, and dating the next deadline from before it would put
+                    // that deadline in the past and refresh again immediately.
+                    refreshAssignment(System.nanoTime());
                 }
                 if (owned.isEmpty()) {
                     LockSupport.parkNanos(ERROR_BACKOFF_NANOS);
                     continue;
                 }
-                if (next >= owned.size()) {
-                    next = 0;
+                maintainCommits(false);
+                issuePolls();
+                if (!awaitCompletion()) {
+                    return;
                 }
-                long partition = owned.get(next++);
-                Cursor cursor = cursors.get(partition);
-                PolledMessages polled =
-                        client
-                                .messages()
-                                .pollMessages(
-                                        streamId,
-                                        topicId,
-                                        Optional.of(partition),
-                                        consumer,
-                                        PollingStrategy.offset(BigInteger.valueOf(cursor.next)),
-                                        pollSize,
-                                        false)
-                                .get();
-                if (polled.messages().isEmpty()) {
-                    if (polled.partitionId() != null
-                            && polled.partitionId() == RESYNC_REQUIRED_PARTITION_SENTINEL) {
-                        // The server fenced the poll: the assignment moved. Re-sync before the
-                        // next poll instead of spinning on the stale partition.
-                        assignmentStale = true;
-                        LockSupport.parkNanos(ERROR_BACKOFF_NANOS);
-                        continue;
-                    }
-                    emptyPolls++;
-                    if (emptyPolls >= owned.size()) {
-                        emptyPolls = 0;
-                        LockSupport.parkNanos(IDLE_BACKOFF_NANOS);
-                    }
-                    continue;
-                }
-                emptyPolls = 0;
-                long lastOffset = deliver(polled);
-                cursor.next = lastOffset + 1;
-                cursor.dirty = true;
-                maybeCommit(partition, cursor, false);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;
@@ -234,10 +276,208 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
         }
     }
 
+    /**
+     * Issues polls for eligible partitions until the concurrency budget is spent.
+     *
+     * <p>A partition is eligible when it is owned, has no poll outstanding, and its backoff has
+     * expired. Backoff is per partition: one partition returning empty must not hold back another
+     * that has messages waiting, which is what a single shared empty-round counter did.
+     *
+     * <p>The sweep resumes after the partition it issued last. Starting from the front every time
+     * would be strict priority by index, and since a partition with messages is eligible again the
+     * moment its reply lands, a busy low-index partition would take the whole budget forever and the
+     * rest would never be polled at all.
+     */
+    private void issuePolls() {
+        long now = System.nanoTime();
+        int size = owned.size();
+        int start = sweepStart;
+        for (int offset = 0; offset < size; offset++) {
+            if (inFlightPolls.size() >= pollConcurrency) {
+                return;
+            }
+            int index = (start + offset) % size;
+            long partition = owned.get(index);
+            Cursor cursor = cursors.get(partition);
+            if (cursor == null
+                    || inFlightPolls.containsKey(partition)
+                    || now - cursor.eligibleAtNanos < 0) {
+                continue;
+            }
+            issuePoll(partition, cursor);
+            sweepStart = index + 1;
+        }
+    }
+
+    private void issuePoll(long partition, Cursor cursor) {
+        long generation = assignmentGeneration;
+        long requestId = nextPollId++;
+        inFlightPolls.put(partition, requestId);
+        CompletableFuture<PolledMessages> poll;
+        try {
+            poll =
+                    client
+                            .messages()
+                            .pollMessages(
+                                    streamId,
+                                    topicId,
+                                    Optional.of(partition),
+                                    consumer,
+                                    PollingStrategy.offset(BigInteger.valueOf(cursor.next)),
+                                    pollSize,
+                                    false);
+        } catch (RuntimeException e) {
+            enqueueCompletion(new Completion(generation, requestId, partition, null, e));
+            return;
+        }
+        poll.whenComplete(
+                (polled, error) ->
+                        enqueueCompletion(new Completion(generation, requestId, partition, polled, error)));
+    }
+
+    private void enqueueCompletion(Completion completion) {
+        synchronized (completionLock) {
+            if (closed.get()) {
+                return;
+            }
+            if (!completions.offer(completion)) {
+                closed.set(true);
+                pollThread.interrupt();
+                log.error("Consumer completion queue exceeded its admitted poll count");
+            }
+        }
+    }
+
+    /**
+     * Waits for one reply and applies it, or returns false when the consumer is closing.
+     *
+     * <p>Parks only when nothing is outstanding and nothing is eligible, so an idle topic still backs
+     * off while a busy one never does.
+     *
+     * @return false when the consumer is closing and the poll loop should stop
+     */
+    private boolean awaitCompletion() throws InterruptedException {
+        Completion completion = completions.poll(IDLE_BACKOFF_MILLIS, TimeUnit.MILLISECONDS);
+        if (completion == null) {
+            return !closed.get();
+        }
+        applyCompletion(completion);
+        // Apply whatever else already arrived before going back for more, so a
+        // burst of replies does not pay a loop iteration each.
+        while ((completion = completions.poll()) != null) {
+            applyCompletion(completion);
+        }
+        return !closed.get();
+    }
+
+    private void applyCompletion(Completion completion) {
+        Long active = inFlightPolls.get(completion.partition);
+        if (active == null || active.longValue() != completion.requestId) {
+            return;
+        }
+        inFlightPolls.remove(completion.partition);
+        if (closed.get()) {
+            return;
+        }
+        Cursor cursor = cursors.get(completion.partition);
+        // A reply from before a rebalance describes a partition this member may
+        // no longer own, so it cannot deliver or move a cursor.
+        if (completion.generation != assignmentGeneration || cursor == null) {
+            return;
+        }
+        if (completion.error != null) {
+            if (!closed.get()) {
+                logPollFailure(completion.error);
+                invalidateAssignment();
+            }
+            cursor.eligibleAtNanos = System.nanoTime() + ERROR_BACKOFF_NANOS;
+            return;
+        }
+        PolledMessages polled = completion.polled;
+        if (polled.messages().isEmpty()) {
+            if (polled.partitionId() != null
+                    && polled.partitionId() == RESYNC_REQUIRED_PARTITION_SENTINEL) {
+                // The server fenced the poll: the assignment moved. Re-sync before
+                // polling this partition again.
+                invalidateAssignment();
+                cursor.eligibleAtNanos = System.nanoTime() + ERROR_BACKOFF_NANOS;
+                return;
+            }
+            cursor.eligibleAtNanos = System.nanoTime() + IDLE_BACKOFF_NANOS;
+            return;
+        }
+        cursor.eligibleAtNanos = System.nanoTime();
+        for (Message message : polled.messages()) {
+            if (closed.get()) {
+                break;
+            }
+            long offset = message.header().offset().longValueExact();
+            if (offset < cursor.next) {
+                continue;
+            }
+            callback.messageReceived(
+                    message.payload(), message.header().originTimestamp().longValue() / 1_000L);
+            cursor.next = Math.addExact(offset, 1);
+            cursor.dirty = true;
+        }
+        if (!closed.get()) {
+            maybeCommit(completion.partition, cursor, false);
+        }
+    }
+
+    /**
+     * Waits for every outstanding poll to report back, applying each as it lands.
+     *
+     * <p>Called before an assignment refresh so no completion arrives after the cursors it refers to
+     * have been replaced or dropped. The replies are applied rather than dropped because they were
+     * issued under the assignment still in force, so their messages are this member's to deliver and
+     * their progress is its to commit.
+     *
+     * @return false when the wait was interrupted
+     */
+    private boolean drainInFlight() {
+        long deadline = System.nanoTime() + DRAIN_TIMEOUT_NANOS;
+        while (!inFlightPolls.isEmpty() && System.nanoTime() - deadline < 0) {
+            Completion completion;
+            try {
+                completion = completions.poll(IDLE_BACKOFF_MILLIS, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+            if (completion != null) {
+                applyCompletion(completion);
+            }
+        }
+        if (!inFlightPolls.isEmpty()) {
+            log.warn(
+                    "Consumer group {} on {}/{}: {} polls did not report back within the drain budget",
+                    groupId,
+                    streamId,
+                    topicId,
+                    inFlightPolls.size());
+            // Giving up on a reply frees its partition to be polled again, so
+            // the abandoned one must not be applied if it lands later: its
+            // cursor has moved on and applying it would rewind or redeliver.
+            // The refresh that follows may keep the same assignment, so it
+            // cannot be relied on to bump this.
+            invalidateAssignment();
+        }
+        return true;
+    }
+
+    private void invalidateAssignment() {
+        assignmentGeneration++;
+        assignmentStale = true;
+    }
+
     // Hands every message to the benchmark and returns the offset of the last one.
     private long deliver(PolledMessages polled) {
         long lastOffset = -1;
         for (Message message : polled.messages()) {
+            if (closed.get()) {
+                break;
+            }
             // originTimestamp is the producer's wall clock in microseconds.
             long publishTimestampMs = message.header().originTimestamp().longValue() / 1_000L;
             callback.messageReceived(message.payload(), publishTimestampMs);
@@ -256,23 +496,46 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
         Optional<ConsumerGroupAssignment> assignment =
                 client.consumerGroups().syncConsumerGroup(streamId, topicId, groupId).get();
         List<Long> mine = assignment.map(a -> List.copyOf(a.partitions())).orElse(List.of());
-        for (Iterator<Map.Entry<Long, Cursor>> it = cursors.entrySet().iterator(); it.hasNext(); ) {
-            Map.Entry<Long, Cursor> entry = it.next();
-            if (!mine.contains(entry.getKey())) {
-                maybeCommit(entry.getKey(), entry.getValue(), true);
-                it.remove();
+        // A fenced cursor goes too, even when the partition is listed again: the server refused
+        // its offset, so its position is stale and a fresh cursor re-reads the stored one.
+        List<Map.Entry<Long, Cursor>> revoked =
+                cursors.entrySet().stream()
+                        .filter(entry -> entry.getValue().fenced || !mine.contains(entry.getKey()))
+                        .toList();
+        if (!settleCommits(revoked, System.nanoTime() + settleTimeoutNanos)) {
+            if (Thread.currentThread().isInterrupted()) {
+                throw new InterruptedException("Interrupted while storing revoked consumer offsets");
             }
+            // Keeping the cursors and retrying on the next refresh would repeat this wait on
+            // every refresh and never poll the retained partitions. The next owner replays
+            // from the last stored offset instead, the fallback the server itself applies when
+            // a hand-off outlives its rebalancing timeout.
+            log.warn(
+                    "Consumer group {} on {}/{}: offsets of revoked partitions {} were not stored within"
+                            + " {} ms, dropping their cursors; the next owner replays from the stored offset",
+                    groupId,
+                    streamId,
+                    topicId,
+                    unsettledPartitions(revoked),
+                    TimeUnit.NANOSECONDS.toMillis(settleTimeoutNanos));
+        }
+        for (Map.Entry<Long, Cursor> entry : revoked) {
+            cursors.remove(entry.getKey());
         }
         for (long partition : mine) {
             if (!cursors.containsKey(partition)) {
                 Cursor cursor = new Cursor();
-                cursor.next = storedOffset(partition).map(offset -> offset + 1).orElse(0L);
+                cursor.next = storedOffset(partition).map(offset -> Math.addExact(offset, 1)).orElse(0L);
                 // The first commit of a fresh cursor is not held back by the interval.
                 cursor.lastCommitNanos = now - commitIntervalNanos;
                 cursors.put(partition, cursor);
             }
         }
-        if (!mine.equals(owned)) {
+        Long generation = assignment.map(ConsumerGroupAssignment::generation).orElse(null);
+        if (!mine.equals(owned) || !java.util.Objects.equals(generation, coordinatorGeneration)) {
+            // Every poll issued under the old set describes an assignment that
+            // no longer holds, so bump the generation gating their replies.
+            assignmentGeneration++;
             log.info(
                     "Consumer group {} on {}/{}: this member owns partitions {} (generation {})",
                     groupId,
@@ -282,8 +545,9 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
                     assignment.map(ConsumerGroupAssignment::generation).orElse(-1L));
         }
         owned = mine;
+        coordinatorGeneration = generation;
         assignmentStale = mine.isEmpty();
-        assignmentRefreshDeadlineNanos = now + ASSIGNMENT_REFRESH_NANOS;
+        assignmentRefreshDeadlineNanos = System.nanoTime() + ASSIGNMENT_REFRESH_NANOS;
     }
 
     private Optional<Long> storedOffset(long partition) throws Exception {
@@ -293,7 +557,7 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
                             .consumerOffsets()
                             .getConsumerOffset(streamId, topicId, Optional.of(partition), consumer)
                             .get();
-            return info.map(ConsumerOffsetInfo::storedOffset).map(BigInteger::longValue);
+            return info.map(ConsumerOffsetInfo::storedOffset).map(BigInteger::longValueExact);
         } catch (ExecutionException e) {
             if (IggyBenchmarkDriver.isNotFound(e)) {
                 return Optional.empty();
@@ -302,46 +566,122 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
         }
     }
 
-    // Stores cursor.next - 1 unless the cursor is clean or the interval has not elapsed.
-    // Fire-and-forget like Kafka's commitAsync; close() waits for the stragglers.
-    private void maybeCommit(long partition, Cursor cursor, boolean force) {
-        if (!cursor.dirty) {
+    private void completeCommit(long partition, Cursor cursor) {
+        if (cursor.commit == null || !cursor.commit.isDone()) {
             return;
         }
-        long now = System.nanoTime();
-        if (!force && commitIntervalNanos > 0 && now - cursor.lastCommitNanos < commitIntervalNanos) {
-            return;
-        }
-        cursor.dirty = false;
-        cursor.lastCommitNanos = now;
-        BigInteger offset = BigInteger.valueOf(cursor.next - 1);
-        CompletableFuture<Void> stored;
         try {
-            stored =
-                    client
-                            .consumerOffsets()
-                            .storeConsumerOffset(streamId, topicId, Optional.of(partition), consumer, offset);
-        } catch (RuntimeException e) {
-            logCommitFailure(partition, offset, e);
-            return;
+            cursor.commit.join();
+            cursor.acknowledged = Math.max(cursor.acknowledged, cursor.committingOffset);
+            cursor.dirty = cursor.next - 1 > cursor.acknowledged;
+        } catch (RuntimeException error) {
+            cursor.dirty = true;
+            if (IggyBenchmarkDriver.isNotOwned(error)) {
+                // The coordinator moved the partition to another member, so this member's offset
+                // is refused for good and a retry cannot succeed. The next refresh drops the
+                // cursor and the new owner replays from the last stored offset.
+                cursor.fenced = true;
+                assignmentStale = true;
+                log.warn(
+                        "Consumer group {} on {}/{}: partition {} was reassigned before offset {} was"
+                                + " stored; the new owner replays from the last stored offset",
+                        groupId,
+                        streamId,
+                        topicId,
+                        partition,
+                        cursor.committingOffset);
+            } else {
+                cursor.commitEligibleNanos = System.nanoTime() + ERROR_BACKOFF_NANOS;
+                logCommitFailure(partition, BigInteger.valueOf(cursor.committingOffset), error);
+            }
         }
-        inFlightCommits.add(stored);
-        stored.whenComplete(
-                (ignored, error) -> {
-                    inFlightCommits.remove(stored);
-                    if (error != null) {
-                        logCommitFailure(partition, offset, error);
-                    }
-                });
+        cursor.commit = null;
     }
 
-    private void logPollFailure(Exception e) {
+    private void maybeCommit(long partition, Cursor cursor, boolean force) {
+        completeCommit(partition, cursor);
+        long now = System.nanoTime();
+        if (cursor.commit != null
+                || cursor.fenced
+                || !cursor.dirty
+                || now - cursor.commitEligibleNanos < 0
+                || (!force
+                        && commitIntervalNanos > 0
+                        && now - cursor.lastCommitNanos < commitIntervalNanos)) {
+            return;
+        }
+        cursor.committingOffset = cursor.next - 1;
+        cursor.lastCommitNanos = now;
+        try {
+            cursor.commit =
+                    client
+                            .consumerOffsets()
+                            .storeConsumerOffset(
+                                    streamId,
+                                    topicId,
+                                    Optional.of(partition),
+                                    consumer,
+                                    BigInteger.valueOf(cursor.committingOffset));
+        } catch (RuntimeException error) {
+            cursor.commitEligibleNanos = System.nanoTime() + ERROR_BACKOFF_NANOS;
+            logCommitFailure(partition, BigInteger.valueOf(cursor.committingOffset), error);
+        }
+    }
+
+    private void maintainCommits(boolean force) {
+        for (Map.Entry<Long, Cursor> entry : cursors.entrySet()) {
+            maybeCommit(entry.getKey(), entry.getValue(), force);
+        }
+    }
+
+    /**
+     * Stores the latest offset of every given cursor and waits until each store is acknowledged,
+     * issuing another store whenever a reply lands with the cursor already ahead of it. A fenced
+     * cursor counts as settled: the server will not take its offset.
+     *
+     * @param entries the cursors to settle, keyed by partition
+     * @param deadline {@link System#nanoTime()} reading after which the wait gives up
+     * @return true when every cursor is settled, false on the deadline or when the calling thread is
+     *     interrupted
+     */
+    private boolean settleCommits(Iterable<Map.Entry<Long, Cursor>> entries, long deadline) {
+        while (true) {
+            boolean unfinished = false;
+            for (Map.Entry<Long, Cursor> entry : entries) {
+                maybeCommit(entry.getKey(), entry.getValue(), true);
+                unfinished |= unsettled(entry.getValue());
+            }
+            if (!unfinished) {
+                return true;
+            }
+            if (Thread.currentThread().isInterrupted() || System.nanoTime() - deadline >= 0) {
+                return false;
+            }
+            LockSupport.parkNanos(IDLE_BACKOFF_NANOS);
+        }
+    }
+
+    private static boolean unsettled(Cursor cursor) {
+        return cursor.commit != null || (cursor.dirty && !cursor.fenced);
+    }
+
+    private static List<Long> unsettledPartitions(Iterable<Map.Entry<Long, Cursor>> entries) {
+        List<Long> partitions = new ArrayList<>();
+        for (Map.Entry<Long, Cursor> entry : entries) {
+            if (unsettled(entry.getValue())) {
+                partitions.add(entry.getKey());
+            }
+        }
+        return partitions;
+    }
+
+    private void logPollFailure(Throwable error) {
         log.warn(
                 "Poll failed for {}/{} group {}: {}",
                 streamId,
                 topicId,
                 groupId,
-                IggyBenchmarkDriver.unwrap(e).toString());
+                IggyBenchmarkDriver.unwrap(error).toString());
     }
 
     private void logCommitFailure(long partition, BigInteger offset, Throwable error) {
@@ -361,9 +701,10 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
 
     @Override
     public void close() throws Exception {
-        if (!closed.compareAndSet(false, true)) {
+        if (!closeStarted.compareAndSet(false, true)) {
             return;
         }
+        closed.set(true);
         pollThread.interrupt();
         try {
             pollThread.join(TimeUnit.SECONDS.toMillis(CLOSE_TIMEOUT_SECONDS));
@@ -371,12 +712,33 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
             Thread.currentThread().interrupt();
         }
         if (!autoCommit) {
-            for (Map.Entry<Long, Cursor> entry : new ArrayList<>(cursors.entrySet())) {
-                maybeCommit(entry.getKey(), entry.getValue(), true);
+            if (pollThread.isAlive()) {
+                // The poll thread owns the cursors and it is still mutating them.
+                // Reading them here would race, and a torn offset is worse than a
+                // missing one: the next run would replay from it.
+                log.warn(
+                        "Consumer group {} on {}/{}: poll thread did not stop, skipping the final offset store",
+                        groupId,
+                        streamId,
+                        topicId);
+            } else {
+                // Replies still on the wire are abandoned, exactly as the blocking
+                // poll abandoned its own. Their messages were never delivered, so
+                // committing their offsets would skip them on the next run.
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(CLOSE_TIMEOUT_SECONDS);
+                if (!settleCommits(cursors.entrySet(), deadline)) {
+                    log.warn(
+                            "Consumer group {} on {}/{}: the final offset store of partitions {} did not"
+                                    + " complete; the next run replays from the last stored offset",
+                            groupId,
+                            streamId,
+                            topicId,
+                            unsettledPartitions(cursors.entrySet()));
+                }
             }
-            IggyBenchmarkDriver.awaitQuietly(
-                    CompletableFuture.allOf(inFlightCommits.toArray(new CompletableFuture[0])),
-                    "storing the final offsets of " + groupId);
+        }
+        synchronized (completionLock) {
+            completions.clear();
         }
         IggyBenchmarkDriver.awaitQuietly(
                 client.consumerGroups().leaveConsumerGroup(streamId, topicId, groupId),
@@ -389,5 +751,45 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
         long next;
         long lastCommitNanos;
         boolean dirty;
+        long acknowledged = -1;
+        long committingOffset;
+        long commitEligibleNanos = System.nanoTime();
+        CompletableFuture<Void> commit;
+
+        /**
+         * Set when the server refused this member's offset because another member owns the partition
+         * now. Nothing more can be stored; the next assignment refresh drops the cursor.
+         */
+        boolean fenced;
+
+        /**
+         * When this partition may be polled again. Set after an empty or failed reply so one quiet
+         * partition backs off alone instead of holding back every other partition's next poll.
+         *
+         * <p>Always a {@link System#nanoTime()} reading, never a sentinel: that clock's origin is
+         * arbitrary and may be negative, so a literal would compare as a deadline in the future.
+         */
+        long eligibleAtNanos = System.nanoTime();
+    }
+
+    /**
+     * One poll reply on its way back to the poll thread, tagged with the assignment generation it was
+     * issued under. Exactly one of {@code polled} and {@code error} is set.
+     */
+    private static final class Completion {
+        private final long generation;
+        private final long requestId;
+        private final long partition;
+        private final PolledMessages polled;
+        private final Throwable error;
+
+        Completion(
+                long generation, long requestId, long partition, PolledMessages polled, Throwable error) {
+            this.generation = generation;
+            this.requestId = requestId;
+            this.partition = partition;
+            this.polled = polled;
+            this.error = error;
+        }
     }
 }

@@ -16,6 +16,7 @@ package io.openmessaging.benchmark.driver.iggy;
 
 import java.util.List;
 import java.util.Map;
+import org.apache.iggy.message.MessageHeader;
 
 /**
  * Driver settings read from the driver yaml (see {@code iggy.yaml}).
@@ -100,21 +101,88 @@ public class IggyConfig {
     /** A producer batch is flushed once its payloads reach this many bytes. */
     public long producerBatchBytes = 1024 * 1024;
 
-    /** Open producer batches are flushed this often, whatever their size. */
+    /**
+     * Time from the first message until a batch becomes ready to send, whatever its size. A ready
+     * batch can accept more messages until it fills or the sender takes it.
+     */
     public long producerLingerMs = 1;
 
-    /**
-     * Batches a producer may have in flight before {@code sendAsync} blocks the worker's load thread,
-     * which is the driver's backpressure. 0 disables the cap.
-     */
+    /** Batches a producer may have in flight before its send lane stops. 0 disables the cap. */
     public int producerMaxInFlightBatches = 16;
+
+    /**
+     * Bytes a producer may hold unacknowledged, across open, queued and in-flight batches, before
+     * {@code sendAsync} blocks the worker's load thread. That block is the driver's backpressure.
+     *
+     * <p>The charge includes payloads and message headers. This is the only bound on accepted data: 0
+     * disables backpressure and lets the queue grow without limit. A negative value derives room for
+     * {@link #producerMaxInFlightBatches} batches, each with {@link #producerBatchBytes} payload
+     * bytes and up to {@link #producerBatchSize} message headers. If the batch cap is also disabled,
+     * a negative value resolves to 0.
+     */
+    public long producerMaxPendingBytes = -1;
+
+    /**
+     * Threads shared by every producer in this worker for encoding and submitting batches.
+     *
+     * <p>The linger timer only moves a batch onto its producer's send queue, so this pool is where
+     * the per-batch work actually runs. Sizing it below the core count is deliberate: the Netty loops
+     * and the worker's load threads need the rest.
+     */
+    public int producerFlushThreads = Math.min(4, Runtime.getRuntime().availableProcessors());
 
     /** Maximum number of messages one consumer poll asks for. */
     public int consumerPollSize = 1000;
+
+    /**
+     * Polls one consumer may have in flight in client-cursor mode ({@link #consumerAutoCommit}
+     * false), across distinct partitions and never more than one per partition. The server-cursor
+     * auto-commit mode always issues one poll at a time, so this setting has no effect there. 1
+     * reproduces the original one-at-a-time sweep.
+     *
+     * <p>A consumer owning P partitions and polling them one at a time revisits each once per P round
+     * trips, so a message arriving just after its partition was visited waits most of a sweep.
+     * Raising this shortens the revisit interval without changing what a single poll asks for, which
+     * is the client half of the partition-count latency growth.
+     */
+    public int consumerPollConcurrency = 1;
+
     // true: the server stores the group offset after every poll (one replicated operation
     // per non-empty poll). false: the consumer keeps its own cursor per owned partition and
     // stores the offset itself, at most once per consumerCommitIntervalMs per partition
     // (0 = after every non-empty poll, the Kafka driver's commitAsync shape).
     public boolean consumerAutoCommit = true;
     public long consumerCommitIntervalMs = 0;
+
+    /**
+     * {@link #producerMaxPendingBytes} with the negative "derive it" case resolved.
+     *
+     * @return the byte budget one producer may hold unacknowledged, or 0 when unbounded
+     */
+    long resolvedMaxPendingBytes() {
+        if (producerMaxPendingBytes >= 0) {
+            return producerMaxPendingBytes;
+        }
+        if (producerMaxInFlightBatches <= 0) {
+            return 0;
+        }
+        try {
+            long headerBytes =
+                    Math.multiplyExact(Math.max(1L, producerBatchSize), (long) MessageHeader.SIZE);
+            long chargedBatchBytes = Math.addExact(Math.max(1, producerBatchBytes), headerBytes);
+            return Math.multiplyExact(chargedBatchBytes, producerMaxInFlightBatches);
+        } catch (ArithmeticException error) {
+            throw new IllegalArgumentException(
+                    "Derived producer byte budget exceeds signed 64-bit range", error);
+        }
+    }
+
+    /**
+     * Poll concurrency after accounting for the server-cursor mode's serial polling contract.
+     *
+     * @return 1 in auto-commit mode, otherwise the configured positive concurrency
+     */
+    int effectiveConsumerPollConcurrency() {
+        return consumerAutoCommit ? 1 : Math.max(1, consumerPollConcurrency);
+    }
 }
