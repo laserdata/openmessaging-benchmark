@@ -23,7 +23,6 @@ import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -74,6 +73,7 @@ public class IggyBenchmarkProducer implements BenchmarkProducer {
     private boolean closed;
     private boolean closeStarted;
     private boolean terminated;
+    private Throwable terminalError;
     private long pendingBytes;
     private long balancedPartition;
     private ScheduledFuture<?> lingerDeadline;
@@ -147,7 +147,11 @@ public class IggyBenchmarkProducer implements BenchmarkProducer {
                 return future;
             }
             if (closed) {
-                future.completeExceptionally(new IllegalStateException("Producer is closed"));
+                future.completeExceptionally(
+                        terminalError == null
+                                ? new IllegalStateException("Producer is closed")
+                                : new IllegalStateException(
+                                        "Producer is closed after a fatal error", terminalError));
                 return future;
             }
             Batch batch = buckets.get(bucketKey);
@@ -160,7 +164,7 @@ public class IggyBenchmarkProducer implements BenchmarkProducer {
             pendingBytes += chargedBytes;
             if (batch.messages.size() >= batchSize || batch.bytes >= batchBytes) {
                 buckets.remove(bucketKey);
-                ready.addLast(batch);
+                markReady(batch);
             } else {
                 try {
                     armLingerDeadline(batch);
@@ -178,9 +182,17 @@ public class IggyBenchmarkProducer implements BenchmarkProducer {
     }
 
     private void armLingerDeadline(Batch batch) {
-        if (lingerDeadline == null && !closed) {
+        if (lingerDeadline == null && !closed && !batch.ready) {
             long delay = Math.max(0, lingerNanos - (clock.getAsLong() - batch.createdNanos));
             lingerDeadline = lingerExecutor.schedule(this::onLingerDeadline, delay, TimeUnit.NANOSECONDS);
+        }
+    }
+
+    // Call under lock. A ready batch stays open until it fills or the sender takes it.
+    private void markReady(Batch batch) {
+        if (!batch.ready) {
+            batch.ready = true;
+            ready.addLast(batch);
         }
     }
 
@@ -193,13 +205,13 @@ public class IggyBenchmarkProducer implements BenchmarkProducer {
                 }
                 long now = clock.getAsLong();
                 Batch oldest = null;
-                Iterator<Batch> open = buckets.values().iterator();
-                while (open.hasNext()) {
-                    Batch batch = open.next();
+                for (Batch batch : buckets.values()) {
+                    if (batch.ready) {
+                        continue;
+                    }
                     long age = now - batch.createdNanos;
                     if (age >= lingerNanos) {
-                        open.remove();
-                        ready.addLast(batch);
+                        markReady(batch);
                     } else if (oldest == null || age > now - oldest.createdNanos) {
                         oldest = batch;
                     }
@@ -246,6 +258,7 @@ public class IggyBenchmarkProducer implements BenchmarkProducer {
                         return;
                     }
                     batch = ready.removeFirst();
+                    buckets.remove(batch.bucketKey, batch);
                     batch.permitHeld = inFlightPermits != null;
                 }
                 send(batch);
@@ -309,7 +322,11 @@ public class IggyBenchmarkProducer implements BenchmarkProducer {
 
     private void terminate(Throwable error) {
         List<Batch> abandoned;
+        boolean reportCause;
         synchronized (lock) {
+            if (terminated) {
+                return;
+            }
             closed = true;
             terminated = true;
             if (lingerDeadline != null) {
@@ -317,9 +334,17 @@ public class IggyBenchmarkProducer implements BenchmarkProducer {
                 lingerDeadline = null;
             }
             abandoned = new ArrayList<>(pending);
+            reportCause = !closeStarted || !abandoned.isEmpty();
+            if (reportCause) {
+                terminalError = error;
+            }
             ready.clear();
             buckets.clear();
             lock.notifyAll();
+        }
+        if (reportCause) {
+            Throwable cause = IggyBenchmarkDriver.unwrap(error);
+            log.warn("Producer for {}/{} terminated: {}", streamId, topicId, cause.toString(), cause);
         }
         for (Batch batch : abandoned) {
             finish(batch, error);
@@ -339,7 +364,7 @@ public class IggyBenchmarkProducer implements BenchmarkProducer {
                 lingerDeadline.cancel(false);
                 lingerDeadline = null;
             }
-            ready.addAll(buckets.values());
+            buckets.values().forEach(this::markReady);
             buckets.clear();
             lock.notifyAll();
         }
@@ -392,6 +417,7 @@ public class IggyBenchmarkProducer implements BenchmarkProducer {
         private final List<CompletableFuture<Void>> futures = new ArrayList<>();
         private long bytes;
         private long chargedBytes;
+        private boolean ready;
         private boolean permitHeld;
         private boolean finished;
 

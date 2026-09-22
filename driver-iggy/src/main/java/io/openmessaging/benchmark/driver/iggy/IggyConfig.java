@@ -16,6 +16,7 @@ package io.openmessaging.benchmark.driver.iggy;
 
 import java.util.List;
 import java.util.Map;
+import org.apache.iggy.message.MessageHeader;
 
 /**
  * Driver settings read from the driver yaml (see {@code iggy.yaml}).
@@ -101,9 +102,8 @@ public class IggyConfig {
     public long producerBatchBytes = 1024 * 1024;
 
     /**
-     * How long an open producer batch waits for more messages before it is sent, whatever its size.
-     * The deadline runs from the batch's first message, so a bucket taking a steady trickle cannot
-     * postpone its own flush.
+     * Time from the first message until a batch becomes ready to send, whatever its size. A ready
+     * batch can accept more messages until it fills or the sender takes it.
      */
     public long producerLingerMs = 1;
 
@@ -114,11 +114,11 @@ public class IggyConfig {
      * Bytes a producer may hold unacknowledged, across open, queued and in-flight batches, before
      * {@code sendAsync} blocks the worker's load thread. That block is the driver's backpressure.
      *
-     * <p>A batch count alone does not bound memory. At 100 topics of 3 MB/s each batch closes on the
-     * linger deadline holding a few kilobytes, so the in-flight cap is reached with a small fraction
-     * of the memory the same cap permits when batches are full. 0 disables the budget and leaves the
-     * batch count as the only bound. Negative derives it as {@link #producerMaxInFlightBatches} whole
-     * batches, which is what the batch cap already implies once batches fill.
+     * <p>The charge includes payloads and message headers. This is the only bound on accepted data: 0
+     * disables backpressure and lets the queue grow without limit. A negative value derives room for
+     * {@link #producerMaxInFlightBatches} batches, each with {@link #producerBatchBytes} payload
+     * bytes and up to {@link #producerBatchSize} message headers. If the batch cap is also disabled,
+     * a negative value resolves to 0.
      */
     public long producerMaxPendingBytes = -1;
 
@@ -135,8 +135,10 @@ public class IggyConfig {
     public int consumerPollSize = 1000;
 
     /**
-     * Polls one consumer may have in flight, across distinct partitions and never more than one per
-     * partition. 1 reproduces the original one-at-a-time sweep.
+     * Polls one consumer may have in flight in client-cursor mode ({@link #consumerAutoCommit}
+     * false), across distinct partitions and never more than one per partition. The server-cursor
+     * auto-commit mode always issues one poll at a time, so this setting has no effect there. 1
+     * reproduces the original one-at-a-time sweep.
      *
      * <p>A consumer owning P partitions and polling them one at a time revisits each once per P round
      * trips, so a message arriving just after its partition was visited waits most of a sweep.
@@ -165,10 +167,22 @@ public class IggyConfig {
             return 0;
         }
         try {
-            return Math.multiplyExact(Math.max(1, producerBatchBytes), producerMaxInFlightBatches);
+            long headerBytes =
+                    Math.multiplyExact(Math.max(1L, producerBatchSize), (long) MessageHeader.SIZE);
+            long chargedBatchBytes = Math.addExact(Math.max(1, producerBatchBytes), headerBytes);
+            return Math.multiplyExact(chargedBatchBytes, producerMaxInFlightBatches);
         } catch (ArithmeticException error) {
             throw new IllegalArgumentException(
                     "Derived producer byte budget exceeds signed 64-bit range", error);
         }
+    }
+
+    /**
+     * Poll concurrency after accounting for the server-cursor mode's serial polling contract.
+     *
+     * @return 1 in auto-commit mode, otherwise the configured positive concurrency
+     */
+    int effectiveConsumerPollConcurrency() {
+        return consumerAutoCommit ? 1 : Math.max(1, consumerPollConcurrency);
     }
 }

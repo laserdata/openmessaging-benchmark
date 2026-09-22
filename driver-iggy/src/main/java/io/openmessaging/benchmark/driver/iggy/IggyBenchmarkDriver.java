@@ -53,6 +53,7 @@ import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientBuilder;
 import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.exception.IggyConflictException;
 import org.apache.iggy.exception.IggyResourceNotFoundException;
+import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
@@ -73,6 +74,9 @@ import org.slf4j.LoggerFactory;
 public class IggyBenchmarkDriver implements BenchmarkDriver {
 
     private static final Logger log = LoggerFactory.getLogger(IggyBenchmarkDriver.class);
+    // Mirrors IggyError::ConsumerGroupPartitionNotOwned in the server. The SDK's IggyErrorCode has
+    // no entry for it yet, so the raw code is matched.
+    private static final int CONSUMER_GROUP_PARTITION_NOT_OWNED = 5009;
 
     private static final ObjectMapper mapper =
             new ObjectMapper(new YAMLFactory())
@@ -108,10 +112,18 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
     @Override
     public void initialize(File configurationFile, StatsLogger statsLogger) throws IOException {
         config = mapper.readValue(configurationFile, IggyConfig.class);
-        config.resolvedMaxPendingBytes();
+        long maxPendingBytes = config.resolvedMaxPendingBytes();
         if (config.producerFlushThreads < 1 || config.consumerPollConcurrency < 1) {
             throw new IllegalArgumentException(
                     "Producer flush threads and consumer poll concurrency must be positive");
+        }
+        if (maxPendingBytes == 0) {
+            log.warn(
+                    "Producer byte backpressure is disabled (producerMaxPendingBytes={},"
+                            + " producerMaxInFlightBatches={}); queued messages are unbounded and"
+                            + " producerRate: 0 can exhaust the heap",
+                    config.producerMaxPendingBytes,
+                    config.producerMaxInFlightBatches);
         }
         streamId = StreamId.of(config.streamName);
         endpoints = endpoints(config);
@@ -145,7 +157,8 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
                 "Iggy driver initialized: endpoints={} ioThreads={} stream={} connectionTimeoutMs={}"
                         + " requestTimeoutMs={} retryPolicy={} topicOptions={} batchSize={} batchBytes={}"
                         + " lingerMs={} maxInFlightBatches={} maxPendingBytes={} flushThreads={}"
-                        + " pollSize={} pollConcurrency={} autoCommit={}"
+                        + " pollSize={} configuredPollConcurrency={} effectivePollConcurrency={}"
+                        + " autoCommit={}"
                         + " commitIntervalMs={}",
                 endpoints,
                 config.ioThreads,
@@ -158,10 +171,11 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
                 config.producerBatchBytes,
                 config.producerLingerMs,
                 config.producerMaxInFlightBatches,
-                config.resolvedMaxPendingBytes(),
+                maxPendingBytes,
                 config.producerFlushThreads,
                 config.consumerPollSize,
                 config.consumerPollConcurrency,
+                config.effectiveConsumerPollConcurrency(),
                 config.consumerAutoCommit,
                 config.consumerCommitIntervalMs);
     }
@@ -504,6 +518,17 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
 
     static boolean isNotFound(Throwable error) {
         return unwrap(error) instanceof IggyResourceNotFoundException;
+    }
+
+    /**
+     * Whether the server refused a consumer group request because another member owns the partition.
+     *
+     * @param error the failure, possibly wrapped in completion or execution exceptions
+     * @return true when the server answered {@code ConsumerGroupPartitionNotOwned}
+     */
+    static boolean isNotOwned(Throwable error) {
+        return unwrap(error) instanceof IggyServerException server
+                && server.getRawErrorCode() == CONSUMER_GROUP_PARTITION_NOT_OWNED;
     }
 
     static Throwable unwrap(Throwable error) {
