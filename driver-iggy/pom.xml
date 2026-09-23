@@ -25,8 +25,7 @@
     <artifactId>driver-iggy</artifactId>
 
     <properties>
-        <!-- Switch to 0.9.0 once it is on Maven Central; 0.8.0 speaks the old TCP framing. -->
-        <iggy.version>0.9.0-SNAPSHOT</iggy.version>
+        <iggy.version>0.9.0</iggy.version>
         <!-- Versions the SDK was built against. The root dependencyManagement would otherwise downgrade them. -->
         <iggy.commons.lang3.version>3.20.0</iggy.commons.lang3.version>
         <iggy.jackson.annotations.version>2.22</iggy.jackson.annotations.version>
