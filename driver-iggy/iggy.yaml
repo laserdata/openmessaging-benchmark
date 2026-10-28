@@ -40,6 +40,13 @@ retryPolicy: default
 retryMaxRetries: 12
 retryDelayMs: 5000
 
+# A sent batch or offset store whose outcome the SDK cannot establish blocks its partition until
+# the driver settles it. resolve replays it with its original id until the server proves the
+# outcome (no duplicates), for up to uncertainOperationTimeoutMs (0 = until close). abandon drops
+# it at once and counts its batch as failed.
+uncertainOperationPolicy: resolve
+uncertainOperationTimeoutMs: 120000
+
 # Stream holding the benchmark topics. Created when missing.
 streamName: omb
 
@@ -47,6 +54,9 @@ streamName: omb
 # parses. Empty means server defaults (enforce_fsync=false, messages_required_to_save=1024,
 # segment_size=1GiB). See iggy-fsync.yaml for the durable cell.
 topicOptions: {}
+
+# Delete the topics this run created when the driver closes. false keeps them and their data.
+deleteTopicsOnClose: true
 
 # A batch becomes ready at producerBatchSize messages, producerBatchBytes bytes of payload,
 # or producerLingerMs after its first message. If sending is blocked, a partial batch can keep filling.

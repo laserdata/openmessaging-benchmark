@@ -17,15 +17,18 @@ package io.openmessaging.benchmark.driver.iggy;
 import io.openmessaging.benchmark.driver.BenchmarkConsumer;
 import io.openmessaging.benchmark.driver.ConsumerCallback;
 import java.math.BigInteger;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -64,6 +67,9 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
     private static final long IDLE_BACKOFF_MILLIS = 1;
     private static final long IDLE_BACKOFF_NANOS = TimeUnit.MILLISECONDS.toNanos(IDLE_BACKOFF_MILLIS);
     private static final long ERROR_BACKOFF_NANOS = TimeUnit.MILLISECONDS.toNanos(100);
+    /** Runs the next replay of an offset store that stayed uncertain. */
+    private static final Executor RESOLVE_LATER =
+            CompletableFuture.delayedExecutor(ERROR_BACKOFF_NANOS, TimeUnit.NANOSECONDS);
     /** How long an assignment refresh waits for outstanding polls to report back. */
     private static final long DRAIN_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(10);
     /**
@@ -91,6 +97,9 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
     private final boolean autoCommit;
     private final long commitIntervalNanos;
     private final long settleTimeoutNanos;
+    private final UncertainOperations.Policy uncertainPolicy;
+    private final Duration resolveTimeout;
+    private final long uncertainTimeoutNanos;
     private final ConsumerCallback callback;
     private final Thread pollThread;
     private final AtomicBoolean closed = new AtomicBoolean();
@@ -166,6 +175,10 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
         this.commitIntervalNanos =
                 TimeUnit.MILLISECONDS.toNanos(Math.max(0, config.consumerCommitIntervalMs));
         this.settleTimeoutNanos = settleTimeoutNanos;
+        this.uncertainPolicy = UncertainOperations.Policy.parse(config.uncertainOperationPolicy);
+        this.resolveTimeout = Duration.ofMillis(Math.max(1, config.requestTimeoutMs));
+        this.uncertainTimeoutNanos =
+                TimeUnit.MILLISECONDS.toNanos(Math.max(0, config.uncertainOperationTimeoutMs));
         this.callback = callback;
         this.pollThread = new Thread(this::pollLoop, "iggy-consumer-" + topicId + "-" + groupId);
         this.pollThread.setDaemon(true);
@@ -593,6 +606,7 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
             } else {
                 cursor.commitEligibleNanos = System.nanoTime() + ERROR_BACKOFF_NANOS;
                 logCommitFailure(partition, BigInteger.valueOf(cursor.committingOffset), error);
+                settleBlocker(partition, cursor, error);
             }
         }
         cursor.commit = null;
@@ -600,6 +614,13 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
 
     private void maybeCommit(long partition, Cursor cursor, boolean force) {
         completeCommit(partition, cursor);
+        if (cursor.blocker != null) {
+            if (!cursor.blocker.isDone()) {
+                return;
+            }
+            // The cursor stayed dirty, so the store below sends the latest offset again.
+            cursor.blocker = null;
+        }
         long now = System.nanoTime();
         if (cursor.commit != null
                 || cursor.fenced
@@ -625,7 +646,51 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
         } catch (RuntimeException error) {
             cursor.commitEligibleNanos = System.nanoTime() + ERROR_BACKOFF_NANOS;
             logCommitFailure(partition, BigInteger.valueOf(cursor.committingOffset), error);
+            settleBlocker(partition, cursor, error);
         }
+    }
+
+    /**
+     * Starts to settle the operation that blocks the offset stores of the partition, when the failure
+     * names one. No store goes out until it is settled, because the SDK would refuse it with {@code
+     * LANE_BLOCKED}.
+     *
+     * @param partition the partition of the cursor
+     * @param cursor the cursor whose store failed
+     * @param error the failure of the store
+     */
+    private void settleBlocker(long partition, Cursor cursor, Throwable error) {
+        OptionalLong operation = UncertainOperations.blockingOperation(error);
+        if (operation.isEmpty() || cursor.blocker != null) {
+            return;
+        }
+        long operationId = operation.getAsLong();
+        long started = System.nanoTime();
+        cursor.blocker =
+                UncertainOperations.settle(
+                        client,
+                        operationId,
+                        uncertainPolicy,
+                        resolveTimeout,
+                        RESOLVE_LATER,
+                        () ->
+                                closed.get()
+                                        || (uncertainTimeoutNanos > 0
+                                                && System.nanoTime() - started - uncertainTimeoutNanos >= 0));
+        cursor.blocker.whenComplete(
+                (ignored, settled) ->
+                        log.warn(
+                                "Consumer group {} on {}/{}: offset store operation {} of partition {} {} after"
+                                        + " {} ms",
+                                groupId,
+                                streamId,
+                                topicId,
+                                Long.toUnsignedString(operationId),
+                                partition,
+                                settled == null
+                                        ? "committed"
+                                        : "ended with " + IggyBenchmarkDriver.unwrap(settled),
+                                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)));
     }
 
     private void maintainCommits(boolean force) {
@@ -755,6 +820,12 @@ public class IggyBenchmarkConsumer implements BenchmarkConsumer {
         long committingOffset;
         long commitEligibleNanos = System.nanoTime();
         CompletableFuture<Void> commit;
+
+        /**
+         * Set while the operation that blocks this partition's offset stores is settled, see {@link
+         * UncertainOperations}. No store goes out until it is done.
+         */
+        CompletableFuture<Void> blocker;
 
         /**
          * Set when the server refused this member's offset because another member owns the partition

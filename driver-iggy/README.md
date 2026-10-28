@@ -55,8 +55,11 @@ transport, through the Java SDK (`org.apache.iggy:iggy`).
 | `requestTimeoutMs`                | `30000`             | Time a request may wait for its reply; bounds how late a dropped request fails                                                                      |
 | `retryPolicy`                     | `default`           | Redial after a lost connection: `default` (12 attempts 5 s apart), `none`, `exponential`, `fixed`                                                   |
 | `retryMaxRetries`, `retryDelayMs` | `12`, `5000`        | Attempts and delay for `retryPolicy: fixed`                                                                                                         |
+| `uncertainOperationPolicy`        | `resolve`           | Sent batch or offset store with an unknown outcome, which blocks its partition: `resolve` replays it until proved, `abandon` fails it               |
+| `uncertainOperationTimeoutMs`     | `120000`            | Time `resolve` replays one operation before it abandons it. `0` = until close. The default of Kafka's `delivery.timeout.ms`                         |
 | `streamName`                      | `omb`               | Stream holding the benchmark topics, created when missing                                                                                           |
 | `topicOptions`                    | `{}`                | Options passed at CreateTopic, keyed by server option name, values as strings                                                                       |
+| `deleteTopicsOnClose`             | `true`              | Delete the topics the run created when the driver closes. `false` keeps them and their data                                                         |
 | `producerBatchSize`               | `1000`              | Flush a batch once it holds this many messages                                                                                                      |
 | `producerBatchBytes`              | `1048576`           | Flush a batch once its payloads reach this many bytes                                                                                               |
 | `producerLingerMs`                | `1`                 | Time in milliseconds from the first message until a batch becomes ready to send. A blocked batch can keep filling.                                  |
@@ -78,7 +81,7 @@ misspelled key cannot silently run with the default.
   `topicOptions`, or from the server defaults when it is empty (`enforce_fsync = false`,
   `messages_required_to_save = 1024`, `segment_size = 1 GiB`). The requested and the effective
   options are logged next to "Created topic". The topics a run created are deleted when the driver
-  closes, so repeated runs do not fill the disk.
+  closes, so repeated runs do not fill the disk. `deleteTopicsOnClose: false` keeps them.
 * fsync cells. `iggy-fsync.yaml` sets `enforce_fsync: "true"` and `messages_required_to_save: "1"`,
   which makes every publish acknowledgement wait for the batch to be fsynced. Acknowledgements are
   durability-gated only when `messages_required_to_save` is 1; a larger value fsyncs in the
@@ -143,6 +146,12 @@ misspelled key cannot silently run with the default.
   client only learns about them after `requestTimeoutMs`. For runs of a few minutes a shorter value
   (10 s) surfaces such failures while the run is still going; `retryPolicy` only governs redialing
   after a lost connection, requests in flight at that moment fail either way.
+* A sent batch or offset store without a proved reply ends with `OPERATION_UNCERTAIN` (14006). The
+  SDK then keeps the operation and refuses every later mutation of that partition with
+  `LANE_BLOCKED` (14007), until the caller resolves or abandons it. With
+  `uncertainOperationPolicy: resolve`, the driver replays the operation with its original id until
+  the server proves its outcome. Then the batches that waited go out in their original order. With
+  `abandon`, the driver drops the operation, fails its batch and opens the partition at once.
 * Every poll with auto-commit writes the consumer offset, and every offset write is a replicated
   partition-plane request. A "commit every N polls" knob is not offered: the server resolves
   `PollingStrategy.next()` from the stored offset, so polls without auto-commit re-serve the same

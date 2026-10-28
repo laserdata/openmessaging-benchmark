@@ -27,7 +27,6 @@ import io.openmessaging.benchmark.driver.BenchmarkProducer;
 import io.openmessaging.benchmark.driver.ConsumerCallback;
 import java.io.File;
 import java.io.IOException;
-import java.math.BigInteger;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -59,7 +58,6 @@ import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.stream.StreamDetails;
-import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.TopicDetails;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -117,6 +115,10 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
             throw new IllegalArgumentException(
                     "Producer flush threads and consumer poll concurrency must be positive");
         }
+        UncertainOperations.Policy.parse(config.uncertainOperationPolicy);
+        if (config.uncertainOperationTimeoutMs < 0) {
+            throw new IllegalArgumentException("uncertainOperationTimeoutMs must be 0 or positive");
+        }
         if (maxPendingBytes == 0) {
             log.warn(
                     "Producer byte backpressure is disabled (producerMaxPendingBytes={},"
@@ -155,7 +157,9 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
         ensureStream();
         log.info(
                 "Iggy driver initialized: endpoints={} ioThreads={} stream={} connectionTimeoutMs={}"
-                        + " requestTimeoutMs={} retryPolicy={} topicOptions={} batchSize={} batchBytes={}"
+                        + " requestTimeoutMs={} retryPolicy={} uncertainOperationPolicy={}"
+                        + " uncertainOperationTimeoutMs={} topicOptions={} deleteTopicsOnClose={}"
+                        + " batchSize={} batchBytes={}"
                         + " lingerMs={} maxInFlightBatches={} maxPendingBytes={} flushThreads={}"
                         + " pollSize={} configuredPollConcurrency={} effectivePollConcurrency={}"
                         + " autoCommit={}"
@@ -166,7 +170,10 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
                 config.connectionTimeoutMs,
                 config.requestTimeoutMs,
                 config.retryPolicy,
+                config.uncertainOperationPolicy,
+                config.uncertainOperationTimeoutMs,
                 config.topicOptions,
+                config.deleteTopicsOnClose,
                 config.producerBatchSize,
                 config.producerBatchBytes,
                 config.producerLingerMs,
@@ -318,14 +325,7 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
     public CompletableFuture<Void> createTopic(String topic, int partitions) {
         return admin
                 .topics()
-                .createTopic(
-                        streamId,
-                        (long) partitions,
-                        CompressionAlgorithm.None,
-                        BigInteger.ZERO,
-                        BigInteger.ZERO,
-                        topic,
-                        topicOptions)
+                .createTopic(streamId, topic, partitions, topicOptions)
                 .thenAccept(
                         details -> {
                             createdTopics.add(topic);
@@ -464,13 +464,17 @@ public class IggyBenchmarkDriver implements BenchmarkDriver {
             flushExecutor.shutdownNow();
         }
         if (admin != null) {
-            for (String topic : new ArrayList<>(createdTopics)) {
-                awaitQuietly(
-                        admin
-                                .topics()
-                                .deleteTopic(streamId, TopicId.of(topic))
-                                .thenRun(() -> log.info("Deleted topic {}", topic)),
-                        "deleting topic " + topic);
+            if (config.deleteTopicsOnClose) {
+                for (String topic : new ArrayList<>(createdTopics)) {
+                    awaitQuietly(
+                            admin
+                                    .topics()
+                                    .deleteTopic(streamId, TopicId.of(topic))
+                                    .thenRun(() -> log.info("Deleted topic {}", topic)),
+                            "deleting topic " + topic);
+                }
+            } else if (!createdTopics.isEmpty()) {
+                log.info("Keeping {} topics (deleteTopicsOnClose: false)", createdTopics.size());
             }
             awaitQuietly(admin.close(), "closing admin connection");
         }

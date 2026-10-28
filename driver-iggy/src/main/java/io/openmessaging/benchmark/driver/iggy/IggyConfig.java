@@ -84,6 +84,23 @@ public class IggyConfig {
     /** Delay between redial attempts for {@code retryPolicy: fixed}, in milliseconds. */
     public long retryDelayMs = 5000;
 
+    /**
+     * What the driver does when the SDK cannot tell whether a sent mutation committed, a producer
+     * batch or a consumer offset store. The SDK then blocks that partition of the connection until
+     * the operation is settled. {@code resolve} replays the kept request with its original id, so
+     * the server cannot apply it twice, until the outcome is proved. Later batches for the partition
+     * wait and go out afterwards in their original order. {@code abandon} drops the operation at
+     * once: its batch counts as failed, though it can have committed, and the partition opens again.
+     */
+    public String uncertainOperationPolicy = "resolve";
+
+    /**
+     * How long {@code resolve} replays one operation before it abandons it, in milliseconds, checked
+     * after each replay. 0 replays until the producer or consumer closes. The default is the default
+     * of Kafka's {@code delivery.timeout.ms}.
+     */
+    public long uncertainOperationTimeoutMs = 120000;
+
     /** Stream that holds the benchmark topics. Created when missing. */
     public String streamName = "omb";
 
@@ -94,6 +111,13 @@ public class IggyConfig {
      * Empty means server defaults.
      */
     public Map<String, String> topicOptions = Map.of();
+
+    /**
+     * Delete the topics this driver created when it closes, so repeated runs do not fill the disk.
+     * false keeps them, with their data, for example to watch a lagging replica catch up after the
+     * load stops.
+     */
+    public boolean deleteTopicsOnClose = true;
 
     /** A producer batch is flushed once it holds this many messages. */
     public int producerBatchSize = 1000;

@@ -20,14 +20,19 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import io.openmessaging.benchmark.driver.ConsumerCallback;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.math.BigInteger;
+import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
@@ -49,6 +54,8 @@ import org.apache.iggy.client.async.ConsumerOffsetsClient;
 import org.apache.iggy.client.async.MessagesClient;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.consumergroup.ConsumerGroupAssignment;
+import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyOperationException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
@@ -59,6 +66,7 @@ import org.apache.iggy.message.MessageId;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.SendMessagesResponse;
+import org.apache.iggy.partition.PartitionContext;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -638,6 +646,149 @@ class IggyBenchmarkConcurrencyTest {
         assertTrue(((java.util.Queue<?>) field(fixture.consumer, "completions")).isEmpty());
     }
 
+    @Test
+    void uncertainSendIsResolvedAndBlockedBatchesGoOutAgainInOrder() throws Exception {
+        ProducerFixture fixture = new ProducerFixture();
+        fixture.config.producerMaxInFlightBatches = 3;
+        CompletableFuture<byte[]> resolved = new CompletableFuture<>();
+        when(fixture.client.resolveOperation(anyLong(), any(Duration.class))).thenReturn(resolved);
+        IggyBenchmarkProducer producer = fixture.create();
+        List<CompletableFuture<Void>> messages = new ArrayList<>();
+        for (int index = 1; index <= 3; index++) {
+            messages.add(producer.sendAsync(Optional.of("key"), new byte[] {(byte) index}));
+        }
+        runAll(fixture.tasks);
+        assertEquals(List.of(1, 2, 3), fixture.payloads);
+
+        // The SDK fails the queued sends of the lane before it reports the uncertain one.
+        fixture.replies.get(1).completeExceptionally(blocked(7));
+        fixture.replies.get(2).completeExceptionally(blocked(7));
+        fixture.replies.get(0).completeExceptionally(uncertain(7));
+        verify(fixture.client).resolveOperation(eq(7L), any(Duration.class));
+        messages.add(producer.sendAsync(Optional.of("key"), new byte[] {4}));
+        runAll(fixture.tasks);
+        assertEquals(List.of(1, 2, 3), fixture.payloads);
+        assertTrue(messages.stream().noneMatch(CompletableFuture::isDone));
+
+        resolved.complete(new byte[0]);
+        messages.get(0).get(1, TimeUnit.SECONDS);
+        runAll(fixture.tasks);
+        assertEquals(List.of(1, 2, 3, 2, 3, 4), fixture.payloads);
+        for (int index = 3; index < 6; index++) {
+            fixture.replies.get(index).complete(SendMessagesResponse.empty());
+        }
+        CompletableFuture.allOf(messages.toArray(CompletableFuture[]::new)).get(1, TimeUnit.SECONDS);
+        assertEquals(0L, field(producer, "pendingBytes"));
+        producer.close();
+    }
+
+    @Test
+    void sendThatStaysUncertainIsReplayedAfterAPause() throws Exception {
+        ProducerFixture fixture = new ProducerFixture();
+        when(fixture.client.resolveOperation(anyLong(), any(Duration.class)))
+                .thenReturn(
+                        CompletableFuture.failedFuture(uncertain(7)),
+                        CompletableFuture.completedFuture(new byte[0]));
+        IggyBenchmarkProducer producer = fixture.create();
+        CompletableFuture<Void> message = producer.sendAsync(Optional.empty(), new byte[] {1});
+        runAll(fixture.tasks);
+        fixture.replies.get(0).completeExceptionally(uncertain(7));
+        assertEquals(1, fixture.timers.size());
+        assertTrue(!message.isDone());
+        fixture.timers.removeFirst().run();
+        message.get(1, TimeUnit.SECONDS);
+        verify(fixture.client, times(2)).resolveOperation(eq(7L), any(Duration.class));
+        verify(fixture.client, never()).abandonOperation(anyLong());
+        producer.close();
+    }
+
+    @Test
+    void resolveAbandonsTheOperationAfterTheUncertainTimeout() throws Exception {
+        ProducerFixture fixture = new ProducerFixture();
+        fixture.config.uncertainOperationTimeoutMs = 1000;
+        when(fixture.client.resolveOperation(anyLong(), any(Duration.class)))
+                .thenReturn(CompletableFuture.failedFuture(uncertain(7)));
+        when(fixture.client.abandonOperation(anyLong()))
+                .thenReturn(CompletableFuture.completedFuture(null));
+        IggyBenchmarkProducer producer = fixture.create();
+        CompletableFuture<Void> message = producer.sendAsync(Optional.empty(), new byte[] {1});
+        runAll(fixture.tasks);
+        fixture.replies.get(0).completeExceptionally(uncertain(7));
+        fixture.clock.addAndGet(TimeUnit.SECONDS.toNanos(2));
+        fixture.timers.removeFirst().run();
+        CompletionException failed = assertThrows(CompletionException.class, message::join);
+        assertEquals(
+                IggyErrorCode.OPERATION_UNCERTAIN,
+                ((IggyOperationException) failed.getCause()).getErrorCode());
+        verify(fixture.client).abandonOperation(7L);
+        assertTrue(fixture.timers.isEmpty());
+        assertEquals(0L, field(producer, "pendingBytes"));
+        producer.close();
+    }
+
+    @Test
+    void abandonPolicyFailsTheUncertainBatchAndSendsTheBlockedOne() throws Exception {
+        ProducerFixture fixture = new ProducerFixture();
+        fixture.config.producerMaxInFlightBatches = 2;
+        fixture.config.uncertainOperationPolicy = "abandon";
+        when(fixture.client.abandonOperation(anyLong()))
+                .thenReturn(CompletableFuture.completedFuture(null));
+        IggyBenchmarkProducer producer = fixture.create();
+        CompletableFuture<Void> first = producer.sendAsync(Optional.of("key"), new byte[] {1});
+        CompletableFuture<Void> second = producer.sendAsync(Optional.of("key"), new byte[] {2});
+        runAll(fixture.tasks);
+        fixture.replies.get(1).completeExceptionally(blocked(7));
+        fixture.replies.get(0).completeExceptionally(uncertain(7));
+        CompletionException failed = assertThrows(CompletionException.class, first::join);
+        assertEquals(
+                IggyErrorCode.OPERATION_UNCERTAIN,
+                ((IggyOperationException) failed.getCause()).getErrorCode());
+        runAll(fixture.tasks);
+        assertEquals(List.of(1, 2, 2), fixture.payloads);
+        fixture.replies.get(2).complete(SendMessagesResponse.empty());
+        second.get(1, TimeUnit.SECONDS);
+        verify(fixture.client, never()).resolveOperation(anyLong(), any(Duration.class));
+        producer.close();
+    }
+
+    @Test
+    void uncertainOffsetStoreHoldsBackTheNextStoreUntilItIsResolved() throws Exception {
+        ConsumerFixture fixture = new ConsumerFixture(1, List.of(0L));
+        CompletableFuture<byte[]> resolved = new CompletableFuture<>();
+        when(fixture.client.resolveOperation(anyLong(), any(Duration.class))).thenReturn(resolved);
+        fixture.refresh();
+        fixture.read(0);
+        assertEquals(List.of(BigInteger.ZERO), fixture.storedOffsets);
+        fixture.commits.get(0).completeExceptionally(uncertain(9));
+        invoke(fixture.consumer, "maintainCommits", false);
+        verify(fixture.client).resolveOperation(eq(9L), any(Duration.class));
+        Object cursor = ((Map<?, ?>) field(fixture.consumer, "cursors")).get(0L);
+        setField(cursor, "commitEligibleNanos", System.nanoTime() - 1);
+        invoke(fixture.consumer, "maintainCommits", false);
+        assertEquals(List.of(BigInteger.ZERO), fixture.storedOffsets);
+
+        resolved.complete(new byte[0]);
+        invoke(fixture.consumer, "maintainCommits", false);
+        assertEquals(List.of(BigInteger.ZERO, BigInteger.ZERO), fixture.storedOffsets);
+        fixture.commits.get(1).complete(null);
+        invoke(fixture.consumer, "maintainCommits", false);
+        assertEquals(false, field(cursor, "dirty"));
+    }
+
+    private static IggyOperationException uncertain(long operationId) {
+        return new IggyOperationException(IggyErrorCode.OPERATION_UNCERTAIN, operationId);
+    }
+
+    private static IggyOperationException blocked(long operationId) {
+        return new IggyOperationException(IggyErrorCode.LANE_BLOCKED, operationId);
+    }
+
+    private static void runAll(Deque<Runnable> tasks) {
+        while (!tasks.isEmpty()) {
+            tasks.removeFirst().run();
+        }
+    }
+
     private static PolledMessages polled(long partition, long offset) {
         MessageHeader header =
                 new MessageHeader(
@@ -650,7 +801,8 @@ class IggyBenchmarkConcurrencyTest {
                         1L,
                         BigInteger.ZERO);
         Message message = Message.of(header, new byte[] {(byte) offset}, null);
-        return new PolledMessages(partition, BigInteger.valueOf(offset), 1L, List.of(message));
+        return new PolledMessages(
+                partition, BigInteger.valueOf(offset), 1L, List.of(message), PartitionContext.EMPTY);
     }
 
     private static Object field(Object target, String name) throws Exception {
